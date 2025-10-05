@@ -39,15 +39,52 @@ async def _health(request):
     return web.Response(text="OK")
 
 async def _setup_http():
+    """Start a tiny HTTP health server.
+    - Tries $PORT if provided, otherwise 10000, then falls back to an ephemeral port (0).
+    - Binds to 127.0.0.1 for local dev to avoid firewall prompts & conflicts; override with HOST=0.0.0.0 if needed.
+    - Never crashes the bot if binding fails.
+    """
     app = web.Application()
     app.router.add_get("/", _health)
     app.router.add_get("/health", _health)
-    port = int(os.getenv("PORT", "10000"))
+
+    host_env = os.getenv("HOST")
+    host = host_env or ("0.0.0.0" if os.getenv("PORT") else "127.0.0.1")
+    ports_to_try: list[int] = []
+    if os.getenv("PORT"):
+        try:
+            ports_to_try.append(int(os.getenv("PORT")))
+        except Exception:
+            pass
+    ports_to_try += [10000, 0]  # 0 -> let OS choose a free port
+
     runner = web.AppRunner(app)
     await runner.setup()
-    site = web.TCPSite(runner, host="0.0.0.0", port=port)
-    await site.start()
-    logging.getLogger("http").info(f"HTTP health server running on 0.0.0.0:{port}")
+
+    last_err = None
+    for port in ports_to_try:
+        try:
+            site = web.TCPSite(runner, host=host, port=port)
+            await site.start()
+            actual_port = port
+            try:
+                # when port=0, get the real chosen port
+                if getattr(site, "_server", None) and site._server.sockets:
+                    actual_port = site._server.sockets[0].getsockname()[1]
+            except Exception:
+                pass
+            logging.getLogger("http").info(f"HTTP health server running on {host}:{actual_port}")
+            return
+        except OSError as e:
+            last_err = e
+            logging.getLogger("http").warning(f"Port {port} unavailable ({e}); trying next...")
+        except Exception as e:
+            last_err = e
+            logging.getLogger("http").exception("Health server start failed; continuing without it.")
+            break
+
+    # If we got here, we couldn't bind at all — continue without HTTP server
+    logging.getLogger("http").warning(f"Health server NOT started. Reason: {last_err}")
 
 # ===== Konfiguracja =====
 load_dotenv()
@@ -74,6 +111,7 @@ log = logging.getLogger("discord")
 # Rejestry aktywnych ogłoszeń
 ACTIVE_CAPTS: dict[tuple[int, int], "CaptView"] = {}
 ACTIVE_AIRDROPS: dict[tuple[int, int], "AirdropView"] = {}
+ACTIVE_EVENTS: dict[tuple[int, int], "EventView"] = {}
 SQUADS: dict[int, dict] = {}  # {msg_id: {...}}
 
 # ===== Check roli (z ID w kodzie) =====
@@ -107,7 +145,7 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
 # ===== Pomocnicze =====
 def fmt_users(user_ids: list[int], guild: discord.Guild, limit: int = 25) -> str:
     if not user_ids:
-        return "—"
+        return "-"
     lines = []
     for uid in user_ids[:limit]:
         m = guild.get_member(uid)
@@ -202,7 +240,7 @@ def make_pick_embed(selected_ids: list[int], total_count: int, guild: discord.Gu
         m = guild.get_member(uid)
         lines.append(f"{i}. {m.mention} | {m.display_name}" if m else f"{i}. <@{uid}>")
     now_pl = datetime.now(tz=WARSAW) if WARSAW else datetime.now()
-    desc = f"Wybrano {len(selected_ids)}/{total_count} osób:\n\n**Wybrani gracze:**\n" + ("\n".join(lines) if lines else "—")
+    desc = f"Wybrano {len(selected_ids)}/{total_count} osób:\n\n**Wybrani gracze:**\n" + ("\n".join(lines) if lines else "-")
     emb = discord.Embed(title="Lista osób na captures!", description=desc, color=0xFFFFFF)
     thumb = _thumb_url(guild)
     if thumb: emb.set_thumbnail(url=thumb)
@@ -214,11 +252,11 @@ def make_airdrop_embed(starts_at: datetime, users: list[int], guild: discord.Gui
                        author: discord.Member, info_text: str,
                        voice: discord.VoiceChannel | None, max_slots: int, queue_len: int) -> discord.Embed:
     ts = int(starts_at.timestamp())
-    desc_parts = []
+    desc_parts: list[str] = []
     if info_text:
         desc_parts.append(f"{info_text}\n")
     desc_parts.append("**Kanał głosowy:**")
-    desc_parts.append(voice.mention if voice else "—")
+    desc_parts.append(voice.mention if voice else "-")
     desc_parts.append("")
     desc_parts.append("**Czas rozpoczęcia:**")
     desc_parts.append(f"Rozpoczęcie AirDrop o <t:{ts}:t> ( <t:{ts}:R> )")
@@ -227,11 +265,12 @@ def make_airdrop_embed(starts_at: datetime, users: list[int], guild: discord.Gui
         desc_parts.append(f"**Kolejka:** {queue_len}")
     desc = "\n".join(desc_parts)
 
-    field_name = f"Zapisani ({len(users)}/{max_slots})" if max_slots and max_slots > 0 else f"Zapisani ({len(users)})"
+    field_name = f"Zapisani ({len(users)}/{max_slots})" if (max_slots and max_slots > 0) else f"Zapisani ({len(users)})"
     emb = discord.Embed(title="AirDrop!", description=desc, color=0xFFFFFF)
-    emb.add_field(name=field_name, value="—", inline=False)  # nie pokazujemy listy nicków
+    emb.add_field(name=field_name, value="-", inline=False)
     thumb = _thumb_url(guild)
-    if thumb: emb.set_thumbnail(url=thumb)
+    if thumb:
+        emb.set_thumbnail(url=thumb)
     emb.set_footer(text=f"Wystawione przez {author.display_name}")
     return emb
 
@@ -241,7 +280,7 @@ def make_airdrop_picked_embed(picked_ids: list[int], guild: discord.Guild, picke
         m = guild.get_member(uid)
         lines.append(f"{i}. {m.mention} | {m.display_name}" if m else f"{i}. <@{uid}>")
     now_pl = datetime.now(tz=WARSAW) if WARSAW else datetime.now()
-    desc = "**Wytypowani na AirDrop:**\n" + ("\n".join(lines) if lines else "—")
+    desc = "**Wytypowani na AirDrop:**\n" + ("\n".join(lines) if lines else "-")
     emb = discord.Embed(title="Wytypowani na AirDrop!", description=desc, color=0xFFFFFF)
     thumb = _thumb_url(guild)
     if thumb: emb.set_thumbnail(url=thumb)
@@ -532,11 +571,9 @@ class AirdropView(discord.ui.View):
         self.message: discord.Message | None = None
         self.picked_message: discord.Message | None = None
         self._lock = asyncio.Lock()
+        self.queue: list[int] = []
+        self.queue: list[int] = []  # kolejka chętnych (gdy limit miejsc)
 
-        if self.max_slots <= 0:
-            for item in list(self.children):
-                if isinstance(item, discord.ui.Button) and item.label == "Dołącz do kolejki":
-                    self.remove_item(item)
 
     async def refresh_embed(self):
         if not self.message:
@@ -605,7 +642,7 @@ class AirdropView(discord.ui.View):
             if uid in self.users:
                 await interaction.response.send_message("Jesteś już zapisany. Nie trzeba do kolejki.", ephemeral=True); return
             if len(self.users) < self.max_slots:
-                await interaction.response.send_message("Są wolne miejsca — kliknij **Dołącz**.", ephemeral=True); return
+                await interaction.response.send_message("Są wolne miejsca - kliknij **Dołącz**.", ephemeral=True); return
             if uid in self.queue:
                 await interaction.response.send_message("Jesteś już w kolejce.", ephemeral=True); return
             self.queue.append(uid)
@@ -774,6 +811,7 @@ async def create_capt(interaction: discord.Interaction, start_time: str, image_u
     await interaction.response.send_message(content="@everyone", embed=embed, view=view, allowed_mentions=allowed)
     msg = await interaction.original_response()
     view.message = msg
+    ACTIVE_EVENTS[(interaction.guild.id, interaction.channel.id)] = view
     ACTIVE_CAPTS[(interaction.guild.id, interaction.channel.id)] = view
     async def ticker():
         try:
@@ -878,6 +916,341 @@ async def panel_airdrop(interaction: discord.Interaction):
         view=view, ephemeral=True
     )
 
+
+# ===== EVENT: helpers, views, command =====
+class EventSignupModal(discord.ui.Modal, title="Zapis na event"):
+    def __init__(self, ev_view: "EventView"):
+        super().__init__(timeout=180)
+        self.ev_view = ev_view
+        self.info = discord.ui.TextInput(
+            label="Imię Nazwisko | UID",
+            placeholder="np. Jan Kowalski | 123456 (lub dowolny opis)",
+            max_length=100,
+            required=True,
+        )
+        self.add_item(self.info)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        text = str(self.info.value).strip()
+        if not text:
+            return await interaction.response.send_message("Wpisz dowolny opis (np. Imię Nazwisko | UID).", ephemeral=True)
+        async with self.ev_view._lock:
+            uid = interaction.user.id
+            if self.ev_view.max_slots > 0 and len(self.ev_view.signups) >= self.ev_view.max_slots and uid not in self.ev_view.signups:
+                return await interaction.response.send_message(f"Limit zapisów osiągnięty ({self.ev_view.max_slots}).", ephemeral=True)
+            self.ev_view.signups[uid] = text
+        await interaction.response.send_message("✅ Zapisano na event.", ephemeral=True)
+        await self.ev_view.refresh_embed()
+
+def make_event_embed(ev_view: "EventView") -> discord.Embed:
+    ts_start = int(ev_view.starts_at.timestamp())
+    ts_tp = int(ev_view.teleport_at.timestamp())
+    desc = (
+        f"**Start:** <t:{ts_start}:t> • <t:{ts_start}:R>\n"
+        f"**Teleportacja:** <t:{ts_tp}:t> • <t:{ts_tp}:R>\n"
+        f"**Kanał głosowy:** {ev_view.voice.mention if ev_view.voice else '-'}\n\n"
+        "Kliknij **Zapisz się** aby dołączyć. Wpisz: `Imię Nazwisko | UID`.\n"
+    )
+    count = len(ev_view.signups)
+    field_name = f"Zapisani ({count}/{ev_view.max_slots})" if ev_view.max_slots > 0 else f"Zapisani ({count})"
+    emb = discord.Embed(title=ev_view.name, description=desc, color=0xFFFFFF)
+    if _thumb_url(ev_view.guild): emb.set_thumbnail(url=_thumb_url(ev_view.guild))
+    emb.add_field(name=field_name, value="-", inline=False)  # nie pokazujemy listy
+    return emb
+
+def make_event_picked_embed(ev_view: "EventView", picker: discord.Member | None) -> discord.Embed:
+    lines = []
+    for i, uid in enumerate(ev_view.picked_ids, start=1):
+        m = ev_view.guild.get_member(uid)
+        user_label = f"{m.mention} | {ev_view.signups.get(uid, '')}" if m else f"<@{uid}> | {ev_view.signups.get(uid, '')}"
+        lines.append(f"{i}. {user_label}")
+    now_pl = datetime.now(tz=WARSAW) if WARSAW else datetime.now()
+    title = f"Wytypowani na {ev_view.name}!"
+    desc = "**Wytypowani na Event:**\n" + ("\n".join(lines) if lines else "-")
+    emb = discord.Embed(title=title, description=desc, color=0xFFFFFF)
+    if _thumb_url(ev_view.guild): emb.set_thumbnail(url=_thumb_url(ev_view.guild))
+    footer_by = picker.display_name if isinstance(picker, discord.Member) else (picker or "Bot")
+    emb.set_footer(text=f"Wytypował: {footer_by} • {now_pl.strftime('%d.%m.%Y %H:%M')}")
+    return emb
+
+class EventPickView(discord.ui.View):
+    def __init__(self, ev_view: "EventView", picker: discord.Member):
+        super().__init__(timeout=300)
+        self.ev_view = ev_view
+        self.picker = picker
+        options = []
+        signed = list(ev_view.signups.items())
+        # pokaż max 25 na raz (Discord limit)
+        for idx, (uid, info) in enumerate(signed[:25], start=1):
+            m = ev_view.guild.get_member(uid)
+            label = (f"{idx}. {(m.display_name if m else 'Użytkownik')}")[:100]
+            desc = (info or f"ID {uid}")[:100]
+            options.append(discord.SelectOption(label=label, value=str(uid), description=desc))
+        max_vals = min(ev_view.max_slots if ev_view.max_slots > 0 else 25, len(options)) or 1
+        self.sel = discord.ui.Select(placeholder="Wybierz osoby do wystawienia", min_values=0, max_values=max_vals, options=options)
+        self.add_item(self.sel)
+
+        async def _on_select(inter: discord.Interaction):
+            chosen_ids = [int(v) for v in self.sel.values]
+            if not chosen_ids:
+                txt = "Nic nie zaznaczono. Kliknij **Publikuj wytypowanych**."
+            else:
+                lines = []
+                for i, uid in enumerate(chosen_ids, start=1):
+                    m = ev_view.guild.get_member(uid)
+                    lines.append(f"{i}. {m.display_name if m else f'ID {uid}'}")
+                txt = f"Zaznaczono {len(chosen_ids)}:\n" + "\n".join(lines)
+            await inter.response.edit_message(content=txt, view=self)
+        self.sel.callback = _on_select
+
+    @discord.ui.button(label="Publikuj wytypowanych", style=discord.ButtonStyle.success)
+    async def publish(self, interaction: discord.Interaction, _: discord.ui.Button):
+        chosen = [int(v) for v in self.sel.values]
+        if not chosen:
+            return await interaction.response.edit_message(content="Nie wybrałeś żadnych osób.", view=self)
+        # scalaj z poprzednimi wyborami (bez duplikatów)
+        self.ev_view.picked_ids = list(dict.fromkeys(self.ev_view.picked_ids + chosen))
+        await self.ev_view.refresh_picked_embed(interaction.channel, interaction.user)
+        await interaction.response.edit_message(content="Opublikowano/odświeżono listę wytypowanych.", view=self)
+
+    @discord.ui.button(label="Anuluj", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, _: discord.ui.Button):
+        await interaction.response.edit_message(content="Anulowano.", view=None)
+        self.stop()
+
+class EventView(discord.ui.View):
+    def __init__(self, name: str, starts_at: datetime, teleport_at: datetime,
+                 voice: discord.VoiceChannel, guild: discord.Guild, author: discord.Member, max_slots: int = 0):
+        try:
+            remain = int((starts_at - datetime.now(tz=WARSAW)).total_seconds())
+        except Exception:
+            remain = 0
+        timeout_seconds = max(60, remain + 3600)
+        super().__init__(timeout=timeout_seconds)
+        self.name = name
+        self.starts_at = starts_at
+        self.teleport_at = teleport_at
+        self.voice = voice
+        self.guild = guild
+        self.author = author
+        self.max_slots = max(0, int(max_slots or 0))
+        self.signups: dict[int, str] = {}  # user_id -> "Imię Nazwisko | UID"
+        self.picked_ids: list[int] = []
+        self.message: discord.Message | None = None
+        self.picked_message: discord.Message | None = None
+        self._lock = asyncio.Lock()
+
+    async def refresh_embed(self):
+        if self.message:
+            await self.message.edit(embed=make_event_embed(self), view=self)
+
+    async def refresh_picked_embed(self, channel: discord.abc.Messageable, picker: discord.Member | None):
+        emb = make_event_picked_embed(self, picker)
+        if self.picked_message:
+            try:
+                await self.picked_message.edit(embed=emb)
+                return
+            except Exception:
+                self.picked_message = None
+        try:
+            self.picked_message = await channel.send(embed=emb)
+        except Exception:
+            pass
+
+    @discord.ui.button(label="Zapisz się", style=discord.ButtonStyle.success)
+    async def signup(self, interaction: discord.Interaction, _: discord.ui.Button):
+        async with self._lock:
+            if self.max_slots > 0 and len(self.signups) >= self.max_slots and interaction.user.id not in self.signups:
+                return await interaction.response.send_message(f"Limit zapisów osiągnięty ({self.max_slots}).", ephemeral=True)
+        await interaction.response.send_modal(EventSignupModal(self))
+
+    @discord.ui.button(label="Opuść", style=discord.ButtonStyle.danger)
+    async def leave(self, interaction: discord.Interaction, _: discord.ui.Button):
+        async with self._lock:
+            uid = interaction.user.id
+            changed = False
+            if uid in self.signups:
+                del self.signups[uid]; changed = True
+            if uid in self.picked_ids:
+                self.picked_ids.remove(uid); changed = True
+            if uid in self.queue:
+                self.queue.remove(uid); changed = True
+        await interaction.response.send_message("Zaktualizowano.", ephemeral=True)
+        if changed:
+            await self.refresh_embed()
+            await self.refresh_picked_embed(interaction.channel, interaction.user)
+
+    
+    @discord.ui.button(label="Dołącz do chętnych", style=discord.ButtonStyle.secondary)
+    async def join_queue(self, interaction: discord.Interaction, _: discord.ui.Button):
+        if self.max_slots <= 0:
+            return await interaction.response.send_message("Kolejka działa tylko przy ustawionym limicie miejsc.", ephemeral=True)
+        async with self._lock:
+            uid = interaction.user.id
+            if uid in self.signups:
+                return await interaction.response.send_message("Już jesteś zapisany - kolejka niepotrzebna.", ephemeral=True)
+            if len(self.signups) < self.max_slots:
+                return await interaction.response.send_message("Są wolne miejsca - użyj **Zapisz się**.", ephemeral=True)
+            if uid in self.queue:
+                return await interaction.response.send_message("Już jesteś w kolejce chętnych.", ephemeral=True)
+            self.queue.append(uid)
+        await interaction.response.send_message("Dodano do kolejki chętnych.", ephemeral=True)
+        await self.refresh_embed()
+    @discord.ui.button(label="Wystaw na event (ADMIN)", style=discord.ButtonStyle.primary)
+    async def publish_btn(self, interaction: discord.Interaction, _: discord.ui.Button):
+        m: discord.Member = interaction.user
+        is_admin = (m.guild_permissions.administrator or m == self.author or any(r.id == REQUIRED_ROLE_ID for r in m.roles))
+        if not is_admin:
+            return await interaction.response.send_message("Tylko wystawiający / admin / rola uprawniona może wystawiać.", ephemeral=True)
+        if not self.signups:
+            return await interaction.response.send_message("Brak zapisanych.", ephemeral=True)
+        view = EventPickView(self, m)
+        await interaction.response.send_message("Wybierz osoby do **wystawienia** (możesz uruchomić kilka razy aby dodać więcej).",
+                                                view=view, ephemeral=True)
+
+@bot.tree.command(name="create-event", description="Tworzy ogłoszenie eventu z zapisami i wystawianiem.")
+@role_required_check()
+@app_commands.describe(
+    name="Nazwa eventu (np. MCL)",
+    voice="Kanał głosowy do zbiórki",
+    start_time="Godzina startu 24h, np. 18:30 (PL)",
+    teleport_time="Godzina teleportacji 24h, np. 18:15 (PL)",
+    max_slots="Maksymalna liczba zapisów (0 = bez limitu)"
+)
+async def create_event(interaction: discord.Interaction, name: str, voice: discord.VoiceChannel,
+                       start_time: str, teleport_time: str, max_slots: int = 0):
+    # parsowanie czasu
+    try:
+        starts_at = _parse_pl_time(start_time)
+    except Exception:
+        return await interaction.response.send_message("Podaj **start** w formacie HH:MM (np. 18:30).", ephemeral=True)
+    try:
+        teleport_at = _parse_pl_time(teleport_time)
+    except Exception:
+        return await interaction.response.send_message("Podaj **teleport** w formacie HH:MM (np. 18:15).", ephemeral=True)
+
+    author = interaction.user if isinstance(interaction.user, discord.Member) else interaction.guild.get_member(interaction.user.id)
+    view = EventView(name, starts_at, teleport_at, voice, interaction.guild, author, max_slots)
+    embed = make_event_embed(view)
+
+    await interaction.response.send_message(embed=embed, view=view)
+    msg = await interaction.original_response()
+    view.message = msg
+    ACTIVE_EVENTS[(interaction.guild.id, interaction.channel.id)] = view
+
+# ===== EVENT PANEL =====
+class EventAddPickedView(discord.ui.View):
+    def __init__(self, ev: "EventView"):
+        super().__init__(timeout=240)
+        self.ev = ev
+        if not ev.signups:
+            self.add_item(discord.ui.Button(label="Brak zapisanych", style=discord.ButtonStyle.secondary, disabled=True))
+            return
+        options = []
+        for uid, info in list(ev.signups.items())[:25]:
+            m = ev.guild.get_member(uid)
+            label = (m.display_name if m else f"User {uid}")[:100]
+            desc = (info or f"ID {uid}")[:100]
+            options.append(discord.SelectOption(label=label, value=str(uid), description=desc))
+        self.sel = discord.ui.Select(placeholder="Wybierz osoby do WYTYPOWANYCH", min_values=1, max_values=len(options), options=options)
+        self.add_item(self.sel)
+        async def _on_pick(inter: discord.Interaction):
+            await inter.response.defer(ephemeral=True, thinking=False)
+            chosen = [int(v) for v in self.sel.values]
+            added = 0
+            for uid in chosen:
+                if uid not in self.ev.picked_ids:
+                    self.ev.picked_ids.append(uid); added += 1
+            await self.ev.refresh_picked_embed(inter.channel, inter.user)
+            await inter.followup.send(f"✅ Dodano do WYTYPOWANYCH: **{added}**.", ephemeral=True)
+        self.sel.callback = _on_pick
+
+class EventRemovePickedView(discord.ui.View):
+    def __init__(self, ev: "EventView"):
+        super().__init__(timeout=240)
+        self.ev = ev
+        if not ev.picked_ids:
+            self.add_item(discord.ui.Button(label="Lista WYTYPOWANYCH pusta", style=discord.ButtonStyle.secondary, disabled=True))
+            return
+        options = []
+        for uid in ev.picked_ids[:25]:
+            m = ev.guild.get_member(uid)
+            label = (m.display_name if m else f"User {uid}")[:100]
+            desc = (ev.signups.get(uid, f"ID {uid}"))[:100]
+            options.append(discord.SelectOption(label=label, value=str(uid), description=desc))
+        self.sel = discord.ui.Select(placeholder="Wybierz osoby do usunięcia", min_values=1, max_values=len(options), options=options)
+        self.add_item(self.sel)
+        async def _on_rem(inter: discord.Interaction):
+            await inter.response.defer(ephemeral=True, thinking=False)
+            chosen = [int(v) for v in self.sel.values]
+            before = set(self.ev.picked_ids)
+            self.ev.picked_ids = [u for u in self.ev.picked_ids if u not in chosen]
+            removed = len(before) - len(set(self.ev.picked_ids))
+            await self.ev.refresh_picked_embed(inter.channel, inter.user)
+            await inter.followup.send(f"✅ Usunięto z WYTYPOWANYCH: **{removed}**.", ephemeral=True)
+        self.sel.callback = _on_rem
+
+class EventChangeTimesModal(discord.ui.Modal, title="Zmień godziny eventu"):
+    def __init__(self, ev: "EventView"):
+        super().__init__(timeout=180)
+        self.ev = ev
+        self.start_in = discord.ui.TextInput(label="Start (HH:MM)", default=self.ev.starts_at.strftime("%H:%M"))
+        self.tp_in = discord.ui.TextInput(label="Teleport (HH:MM)", default=self.ev.teleport_at.strftime("%H:%M"))
+        self.add_item(self.start_in); self.add_item(self.tp_in)
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            new_start = _parse_pl_time(str(self.start_in.value))
+            new_tp = _parse_pl_time(str(self.tp_in.value))
+        except Exception:
+            return await interaction.response.send_message("Błędny format. Użyj HH:MM.", ephemeral=True)
+        self.ev.starts_at = new_start
+        self.ev.teleport_at = new_tp
+        await self.ev.refresh_embed()
+        await interaction.response.send_message("✅ Zmieniono godziny.", ephemeral=True)
+
+class EventPanelView(discord.ui.View):
+    def __init__(self, ev: "EventView", opener: discord.Member):
+        super().__init__(timeout=600)
+        self.ev = ev
+        self.opener = opener
+    @discord.ui.button(label="➕ Wpisz na WYTYPOWANYCH", style=discord.ButtonStyle.success)
+    async def add_picked(self, interaction: discord.Interaction, _: discord.ui.Button):
+        await interaction.response.send_message("Wybierz osoby do WYTYPOWANYCH:", view=EventAddPickedView(self.ev), ephemeral=True)
+    @discord.ui.button(label="➖ Wypisz z WYTYPOWANYCH", style=discord.ButtonStyle.danger)
+    async def rem_picked(self, interaction: discord.Interaction, _: discord.ui.Button):
+        await interaction.response.send_message("Zaznacz osoby do usunięcia:", view=EventRemovePickedView(self.ev), ephemeral=True)
+    @discord.ui.button(label="⏱️ Zmień godziny", style=discord.ButtonStyle.primary)
+    async def chg_times(self, interaction: discord.Interaction, _: discord.ui.Button):
+        await interaction.response.send_modal(EventChangeTimesModal(self.ev))
+    @discord.ui.button(label="👀 Pokaż kolejkę chętnych", style=discord.ButtonStyle.secondary)
+    async def show_queue(self, interaction: discord.Interaction, _: discord.ui.Button):
+        if not self.ev.queue:
+            return await interaction.response.send_message("Kolejka jest pusta.", ephemeral=True)
+        lines = []
+        for i, uid in enumerate(self.ev.queue, start=1):
+            m = interaction.guild.get_member(uid)
+            lines.append(f"{i}. {m.mention if m else f'<@{uid}>'}")
+        await interaction.response.send_message("**Kolejka chętnych:**\n" + "\n".join(lines), ephemeral=True)
+
+@bot.tree.command(name="panel-event", description="Panel administracyjny eventu w tym kanale.")
+@role_required_check()
+async def panel_event(interaction: discord.Interaction):
+    key = (interaction.guild.id, interaction.channel.id)
+    ev = ACTIVE_EVENTS.get(key)
+    if not ev or not ev.message:
+        return await interaction.response.send_message("Brak aktywnego eventu w tym kanale.", ephemeral=True)
+    m: discord.Member = interaction.user
+    queue_len = len(getattr(ev, "queue", []))
+    queue_info = f" • kolejka: **{queue_len}**" if ev.max_slots else ""
+    lim = f"/{ev.max_slots}" if ev.max_slots else ""
+    if not (m.guild_permissions.administrator or m == ev.author or any(r.id == REQUIRED_ROLE_ID for r in m.roles)):
+        return await interaction.response.send_message("Panel tylko dla wystawiającego/admina/roli uprawnionej.", ephemeral=True)
+    queue_info = f" • kolejka: **{len(getattr(ev, 'queue', []))}**" if ev.max_slots else ""
+    lim = f"/{ev.max_slots}" if ev.max_slots else ""
+    await interaction.response.send_message(
+        f"Panel **{ev.name}** - zapisanych: **{len(ev.signups)}{lim}**{queue_info}. WYTYPOWANI: **{len(ev.picked_ids)}**.",
+        view=EventPanelView(ev, m), ephemeral=True
+    )
 # ====== PINGI: Cayo i Zancudo ======
 def _parse_pl_time(start_time: str) -> datetime:
     try:
