@@ -108,6 +108,21 @@ intents.message_content = False
 intents.members = True
 bot = commands.Bot(command_prefix="!", intents=intents, application_id=int(APPLICATION_ID) if APPLICATION_ID else None)
 
+@bot.event
+async def setup_hook():
+    try:
+        if GUILD_ID:
+            guild_obj = discord.Object(id=int(GUILD_ID))
+            # Szybkie komendy tylko na jednym serwerze podczas developmentu/deployu
+            bot.tree.copy_global_to(guild=guild_obj)
+            await bot.tree.sync(guild=guild_obj)
+            logging.getLogger("discord").info("Slash commands synced to guild %s", GUILD_ID)
+        else:
+            await bot.tree.sync()
+            logging.getLogger("discord").info("Slash commands synced globally")
+    except Exception:
+        logging.getLogger("discord").exception("Slash command sync failed in setup_hook")
+
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("discord")
 
@@ -1488,24 +1503,11 @@ async def main():
         logging.getLogger("http").exception("HTTP health server init failed; continuing without it.")
 
     # Prepare command sync
-    async def sync_commands():
-        try:
-            if GUILD_ID:
-                guild_obj = discord.Object(id=int(GUILD_ID))
-                bot.tree.copy_global_to(guild=guild_obj)
-                await bot.tree.sync(guild=guild_obj)
-            else:
-                await bot.tree.sync()
-        except Exception:
-            logging.getLogger("discord").exception("Slash command sync failed.")
-
     # Robust login with backoff to survive Cloudflare 1015 rate limit on the shared IP
     backoff = 30
     while True:
         try:
-            async with bot:
-                await sync_commands()
-                await bot.start(TOKEN)
+            async with bot:                await bot.start(TOKEN)
             break  # clean exit
         except LoginFailure as e:
             logging.getLogger("discord").error("Login failure: wrong token or permissions: %s", e)
