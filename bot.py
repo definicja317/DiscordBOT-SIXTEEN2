@@ -91,6 +91,7 @@ async def _setup_http():
 # ===== Konfiguracja =====
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
+APPLICATION_ID = os.getenv("APPLICATION_ID")
 GUILD_ID = os.getenv("GUILD_ID")
 
 # <<< TUTAJ WSTAW SWOJE ID ROLI >>>
@@ -105,7 +106,7 @@ CAPT_CHANNEL_ID  = 1422343549386752000  # oznaczany kanał w ogłoszeniu CAPT
 intents = discord.Intents.default()
 intents.message_content = False
 intents.members = True
-bot = commands.Bot(command_prefix="!", intents=intents)
+bot = commands.Bot(command_prefix="!", intents=intents, application_id=int(APPLICATION_ID) if APPLICATION_ID else None)
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("discord")
@@ -1532,3 +1533,5 @@ if __name__ == "__main__":
     if not TOKEN:
         raise SystemExit("Brak DISCORD_TOKEN w .env")
     asyncio.run(main())
+if not getattr(bot, 'application_id', None) and os.getenv('APPLICATION_ID'):
+    bot.application_id = int(os.getenv('APPLICATION_ID'))
