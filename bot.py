@@ -1,6 +1,8 @@
 # --== bot.py ==--
 import os
 import asyncio
+from discord.errors import HTTPException, LoginFailure, GatewayNotFound
+from aiohttp import ClientConnectorError
 import logging
 import random
 from datetime import datetime, timedelta
@@ -1478,13 +1480,55 @@ async def on_ready():
         log.exception("Błąd syncu: %s", e)
 
 async def main():
-    if not TOKEN:
-        raise RuntimeError("Brak DISCORD_TOKEN w .env")
-    # Uruchom równolegle health-serwer oraz bota
-    await _setup_http()  # start HTTP na PORT
-    # Bot jako task – gdy bot się zamknie, proces zakończy się
-    bot_task = asyncio.create_task(bot.start(TOKEN))
-    await bot_task
+    # Start HTTP health server for Render/UptimeRobot pings
+    try:
+        await _setup_http()
+    except Exception:
+        logging.getLogger("http").exception("HTTP health server init failed; continuing without it.")
+
+    # Prepare command sync
+    async def sync_commands():
+        try:
+            if GUILD_ID:
+                guild_obj = discord.Object(id=int(GUILD_ID))
+                bot.tree.copy_global_to(guild=guild_obj)
+                await bot.tree.sync(guild=guild_obj)
+            else:
+                await bot.tree.sync()
+        except Exception:
+            logging.getLogger("discord").exception("Slash command sync failed.")
+
+    # Robust login with backoff to survive Cloudflare 1015 rate limit on the shared IP
+    backoff = 30
+    while True:
+        try:
+            async with bot:
+                await sync_commands()
+                await bot.start(TOKEN)
+            break  # clean exit
+        except LoginFailure as e:
+            logging.getLogger("discord").error("Login failure: wrong token or permissions: %s", e)
+            raise
+        except HTTPException as e:
+            # discord.py raises HTTPException for 4xx/5xx REST calls including /users/@me during login
+            if getattr(e, "status", None) == 429 or "Access denied" in str(e):
+                logging.getLogger("discord").warning("Hit HTTP 429/Cloudflare 1015 during login. Sleeping %ss.", backoff)
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 900)  # up to 15 minutes
+                continue
+            logging.getLogger("discord").exception("HTTPException during start; retrying in %ss", backoff)
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 900)
+        except (ClientConnectorError, OSError, GatewayNotFound) as e:
+            logging.getLogger("discord").warning("Network/Gateway error: %s; retrying in %ss", e, backoff)
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 900)
+        except Exception:
+            logging.getLogger("discord").exception("Unexpected error in bot.start(); retrying in %ss", backoff)
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 900)
 
 if __name__ == "__main__":
+    if not TOKEN:
+        raise SystemExit("Brak DISCORD_TOKEN w .env")
     asyncio.run(main())
