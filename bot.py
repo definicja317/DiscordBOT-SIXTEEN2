@@ -1485,5 +1485,23 @@ async def main():
     bot_task = asyncio.create_task(bot.start(TOKEN))
     await bot_task
 
+
+# === Render-friendly runner ===
+async def __render_main__():
+    # Start health server (non-fatal if it fails)
+    try:
+        await _setup_http()
+    except Exception:
+        pass
+    # Acquire TOKEN from env or existing variable if present
+    TOKEN = os.getenv("DISCORD_TOKEN") or os.getenv("TOKEN") or globals().get("TOKEN")
+    if not TOKEN:
+        raise RuntimeError("Missing DISCORD_TOKEN in environment.")
+    # If this is commands.Bot, use start(); if Client, also start()
+    await bot.start(TOKEN)
+
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(__render_main__())
+    except KeyboardInterrupt:
+        pass
