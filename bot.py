@@ -1,10 +1,10 @@
+# --== bot.py ==--
 import os
 import asyncio
 import logging
 import random
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
-from aiohttp import web  # <— mini-serwer healthcheck
 
 # ===== Strefa czasu „Europe/Warsaw” z bezpiecznym fallbackiem =====
 def get_warsaw_tz():
@@ -32,26 +32,40 @@ import discord
 from discord.ext import commands
 from discord import app_commands
 
+# === NOWOŚĆ: prosty serwer HTTP dla Render/UptimeRobot ===
+from aiohttp import web
+
+async def _health(request):
+    return web.Response(text="OK")
+
+async def _setup_http():
+    app = web.Application()
+    app.router.add_get("/", _health)
+    app.router.add_get("/health", _health)
+    port = int(os.getenv("PORT", "10000"))
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, host="0.0.0.0", port=port)
+    await site.start()
+    logging.getLogger("http").info(f"HTTP health server running on 0.0.0.0:{port}")
+
 # ===== Konfiguracja =====
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 GUILD_ID = os.getenv("GUILD_ID")
-REQUIRED_ROLE_ID = int(os.getenv("REQUIRED_ROLE_ID") or 0)
 
-# <<< USTAW TO >>>
-CAPT_CHANNEL_ID = 1422343549386752001  # np. 123456789012345678 – kanał do wzmianki w ogłoszeniu CAPT
-LOGO_URL = "https://cdn.discordapp.com/icons/1422343547780337819/683dd456c5dc7e124326d4d810992d07.webp?size=1024"  # miniatura (logo)
+# <<< TUTAJ WSTAW SWOJE ID ROLI >>>
+REQUIRED_ROLE_ID = 1422343548216410151  # ← WSTAW ID roli, która ma dostęp do komend
 
-# <<< PINGI: obrazki >>>
-CAYO_IMAGE_URL = "https://cdn.discordapp.com/attachments/1224129510535069766/1414204332747915274/image.png?ex=68e0feeb&is=68dfad6b&hm=6e94ea1a242b13813caddee86833f464d476daebba49b6c441d8f08e81b7baad&"      # <- PODMIEŃ
-ZANCUDO_IMAGE_URL = "https://cdn.discordapp.com/attachments/1224129510535069766/1414194392214011974/image.png?ex=68e0f5a9&is=68dfa429&hm=ee9c6801fd8e897ea8eff6771bce692e72d7604dfd702c467cf0fc32db063919&" # <- PODMIEŃ
-
-# <<< SQUAD ADMINI – UZUPEŁNIJ SWOIMI ID >>>
-ADMIN_USER_IDS: list[int] = [333601079264542722, 921771573113937920, 1007732573063098378, 348583392658456596, 588272459556323329, 1114687688319180820, 1184620388425138183]  # np. [1184620388425138183]
+# <<< USTAWIONE PRZEZ CIEBIE >>>
+CAYO_IMAGE_URL   = "https://cdn.discordapp.com/attachments/1224129510535069766/1414204332747915274/image.png?ex=68e2f92b&is=68e1a7ab&hm=fd48d69d175f8c13eb6070b5ddcb5a40f2352df55288a8df2f48c85b577f4c28&"
+ZANCUDO_IMAGE_URL= "https://cdn.discordapp.com/attachments/1224129510535069766/1414194392214011974/image.png?ex=68e2efe9&is=68e19e69&hm=c4734258cbcd6c77efde3327245c888cd68a2477eea198da96a97e024f664b56&"
+LOGO_URL         = "https://cdn.discordapp.com/icons/1422343547780337819/683dd456c5dc7e124326d4d810992d07.webp?size=1024"
+CAPT_CHANNEL_ID  = 1422343549386752000  # oznaczany kanał w ogłoszeniu CAPT
 
 intents = discord.Intents.default()
 intents.message_content = False
-intents.members = True  # włącz też w Dev Portal -> Privileged Gateway Intents
+intents.members = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 logging.basicConfig(level=logging.INFO)
@@ -60,9 +74,9 @@ log = logging.getLogger("discord")
 # Rejestry aktywnych ogłoszeń
 ACTIVE_CAPTS: dict[tuple[int, int], "CaptView"] = {}
 ACTIVE_AIRDROPS: dict[tuple[int, int], "AirdropView"] = {}
-SQUADS: dict[int, dict] = {}  # {msg_id: {"role_id": int, "members_list": str, "message": Message, "channel_id": int, "author_name": str}}
+SQUADS: dict[int, dict] = {}  # {msg_id: {...}}
 
-# ===== Check roli =====
+# ===== Check roli (z ID w kodzie) =====
 def role_required_check():
     async def predicate(interaction: discord.Interaction) -> bool:
         if interaction.guild is None:
@@ -71,7 +85,7 @@ def role_required_check():
         if m.guild_permissions.administrator or m == interaction.guild.owner:
             return True
         if REQUIRED_ROLE_ID == 0:
-            raise app_commands.CheckFailure("Brak konfiguracji REQUIRED_ROLE_ID w .env.")
+            raise app_commands.CheckFailure("Ustaw REQUIRED_ROLE_ID w kodzie bota.")
         if any(r.id == REQUIRED_ROLE_ID for r in m.roles):
             return True
         raise app_commands.CheckFailure("Nie masz wymaganej roli.")
@@ -101,6 +115,25 @@ def fmt_users(user_ids: list[int], guild: discord.Guild, limit: int = 25) -> str
     if len(user_ids) > limit:
         lines.append(f"… (+{len(user_ids)-limit})")
     return "\n".join(lines)
+
+def format_numbered_users(user_ids: list[int], guild: discord.Guild) -> list[str]:
+    lines = []
+    for i, uid in enumerate(user_ids, start=1):
+        m = guild.get_member(uid)
+        lines.append(f"{i}. {m.mention} | {m.display_name}" if m else f"{i}. <@{uid}>")
+    return lines
+
+def chunk_lines(lines: list[str], max_chars: int = 1800) -> list[str]:
+    chunks, cur, cur_len = [], [], 0
+    for line in lines:
+        ln = len(line) + 1
+        if cur_len + ln > max_chars and cur:
+            chunks.append("\n".join(cur)); cur, cur_len = [line], ln
+        else:
+            cur.append(line); cur_len += ln
+    if cur:
+        chunks.append("\n".join(cur))
+    return chunks
 
 def _thumb_url(guild: discord.Guild) -> str | None:
     url = (LOGO_URL or "").strip()
@@ -176,7 +209,7 @@ def make_pick_embed(selected_ids: list[int], total_count: int, guild: discord.Gu
     emb.set_footer(text=f"Wystawione przez {picker.display_name} • {now_pl.strftime('%d.%m.%Y %H:%M')}")
     return emb
 
-# ---------- EMBED AIRDROP ----------
+# ---------- AIRDROP EMBEDY ----------
 def make_airdrop_embed(starts_at: datetime, users: list[int], guild: discord.Guild,
                        author: discord.Member, info_text: str,
                        voice: discord.VoiceChannel | None, max_slots: int, queue_len: int) -> discord.Embed:
@@ -192,28 +225,28 @@ def make_airdrop_embed(starts_at: datetime, users: list[int], guild: discord.Gui
     if max_slots and max_slots > 0:
         desc_parts.append("")
         desc_parts.append(f"**Kolejka:** {queue_len}")
-
     desc = "\n".join(desc_parts)
+
     field_name = f"Zapisani ({len(users)}/{max_slots})" if max_slots and max_slots > 0 else f"Zapisani ({len(users)})"
     emb = discord.Embed(title="AirDrop!", description=desc, color=0xFFFFFF)
-    emb.add_field(name=field_name, value=fmt_users(users, guild), inline=False)
+    emb.add_field(name=field_name, value="—", inline=False)  # nie pokazujemy listy nicków
     thumb = _thumb_url(guild)
     if thumb: emb.set_thumbnail(url=thumb)
     emb.set_footer(text=f"Wystawione przez {author.display_name}")
     return emb
 
-def make_airdrop_winners_embed(winners: list[int], guild: discord.Guild, picker: discord.Member, from_queue: bool) -> discord.Embed:
+def make_airdrop_picked_embed(picked_ids: list[int], guild: discord.Guild, picker: discord.Member | None) -> discord.Embed:
     lines = []
-    for i, uid in enumerate(winners, start=1):
+    for i, uid in enumerate(picked_ids, start=1):
         m = guild.get_member(uid)
         lines.append(f"{i}. {m.mention} | {m.display_name}" if m else f"{i}. <@{uid}>")
     now_pl = datetime.now(tz=WARSAW) if WARSAW else datetime.now()
-    header = "**Wylosowani z kolejki:**" if from_queue else "**Wylosowani (z zapisanych):**"
-    desc = header + "\n" + ("\n".join(lines) if lines else "—")
-    emb = discord.Embed(title="Wyniki losowania AirDrop", description=desc, color=0xFFFFFF)
+    desc = "**Wytypowani na AirDrop:**\n" + ("\n".join(lines) if lines else "—")
+    emb = discord.Embed(title="Wytypowani na AirDrop!", description=desc, color=0xFFFFFF)
     thumb = _thumb_url(guild)
     if thumb: emb.set_thumbnail(url=thumb)
-    emb.set_footer(text=f"Losował {picker.display_name} • {now_pl.strftime('%d.%m.%Y %H:%M')}")
+    footer_by = picker.display_name if isinstance(picker, discord.Member) else (picker or "Bot")
+    emb.set_footer(text=f"Wytypował: {footer_by} • {now_pl.strftime('%d.%m.%Y %H:%M')}")
     return emb
 
 # ---------- CAPT: PICK okno ----------
@@ -223,14 +256,12 @@ class PickView(discord.ui.View):
         self.capt = capt
         self.total_count = total_count
         self.picker = picker
-        self.nick_by_id = {uid: nick for uid, nick, _ in option_rows}
-        self.user_by_id = {uid: user for uid, _, user in option_rows}
-        max_vals = min(25, len(option_rows)) or 1
         options = []
         for idx, (uid, nick_label, user_desc) in enumerate(option_rows, start=1):
             label = f"{idx}. {nick_label}"[:100]
             desc  = (user_desc or f"ID {uid}")[:100]
             options.append(discord.SelectOption(label=label, value=str(uid), description=desc))
+        max_vals = min(25, len(options)) or 1
         self.select = discord.ui.Select(placeholder="Wybierz graczy (max 25)", min_values=0, max_values=max_vals, options=options)
         self.add_item(self.select)
 
@@ -241,21 +272,18 @@ class PickView(discord.ui.View):
             else:
                 lines = []
                 for i, uid in enumerate(chosen_ids, start=1):
-                    nick = self.nick_by_id.get(uid, f"ID {uid}")
-                    user = self.user_by_id.get(uid)
-                    suffix = f" (@{user})" if user else ""
-                    lines.append(f"{i}. {nick}{suffix}")
+                    m = capt.guild.get_member(uid)
+                    lines.append(f"{i}. {m.display_name if m else f'ID {uid}'}")
                 txt = f"Zaznaczono {len(chosen_ids)}/{self.total_count}:\n" + "\n".join(lines)
             await inter.response.edit_message(content=txt, view=self)
         self.select.callback = _on_select
 
     @discord.ui.button(label="Publikuj listę", style=discord.ButtonStyle.success)
     async def publish(self, interaction: discord.Interaction, _: discord.ui.Button):
-        await interaction.response.defer(ephemeral=True, thinking=False)
+        await interaction.response.send_message("Publikuję listę…", ephemeral=True)
         chosen = [int(v) for v in self.select.values]
         if not chosen:
-            await interaction.followup.send("Nie wybrałeś żadnych osób.", ephemeral=True)
-            return
+            return await interaction.followup.send("Nie wybrałeś żadnych osób.", ephemeral=True)
         self.capt.picked_list = list(dict.fromkeys(chosen))
         emb = make_pick_embed(chosen, len(self.capt.users), self.capt.guild, self.picker)
         msg = await interaction.channel.send(embed=emb)
@@ -264,7 +292,7 @@ class PickView(discord.ui.View):
 
     @discord.ui.button(label="Anuluj", style=discord.ButtonStyle.secondary)
     async def cancel(self, interaction: discord.Interaction, _: discord.ui.Button):
-        await interaction.response.send_message("Anulowano wybieranie.", ephemeral=True)
+        await interaction.response.edit_message(content="Anulowano wybieranie.", view=None)
         self.stop()
 
 # ---------- CAPT: ogłoszenie ----------
@@ -278,7 +306,7 @@ class CaptView(discord.ui.View):
         super().__init__(timeout=timeout_seconds)
         self.starts_at = starts_at
         self.users: list[int] = []
-        self.picked_list: list[int] = []
+        self.picked_list: list[int] = []  # LISTA CAPTURES
         self.guild = guild
         self.author = author
         self.image_url = image_url
@@ -320,7 +348,7 @@ class CaptView(discord.ui.View):
             uid = interaction.user.id
             if uid not in self.users:
                 self.users.append(uid)
-        await interaction.response.defer(ephemeral=True)
+        await interaction.response.send_message("Dołączono.", ephemeral=True)
         await self.refresh_announce()
 
     @discord.ui.button(label="Opuść", style=discord.ButtonStyle.danger)
@@ -332,7 +360,7 @@ class CaptView(discord.ui.View):
                 self.users.remove(uid); changed = True
             if uid in self.picked_list:
                 self.picked_list.remove(uid); changed = True
-        await interaction.response.defer(ephemeral=True)
+        await interaction.response.send_message("Zaktualizowano.", ephemeral=True)
         if changed:
             await self.refresh_announce()
             await self.refresh_pick_embed(interaction.channel, interaction.user)
@@ -340,8 +368,8 @@ class CaptView(discord.ui.View):
     @discord.ui.button(label="PICK", style=discord.ButtonStyle.primary)
     async def pick(self, interaction: discord.Interaction, _: discord.ui.Button):
         mem: discord.Member = interaction.user
-        if not (mem.guild_permissions.administrator or mem == self.author):
-            await interaction.response.send_message("Tylko wystawiający lub administrator może wybierać osoby.", ephemeral=True)
+        if not (mem.guild_permissions.administrator or mem == self.author or any(r.id == REQUIRED_ROLE_ID for r in mem.roles)):
+            await interaction.response.send_message("Tylko wystawiający / admin / rola uprawniona może wybierać osoby.", ephemeral=True)
             return
         if not self.users:
             await interaction.response.send_message("Nikt się jeszcze nie zapisał.", ephemeral=True)
@@ -360,12 +388,129 @@ class CaptView(discord.ui.View):
             option_rows.append((uid, nick_label, user_desc))
         view = PickView(self, option_rows, len(self.users), mem)
         await interaction.response.send_message(
-            "Wybierz graczy (pokazane NICKI). Zaznaczeni pojawią się poniżej. Potem kliknij **Publikuj listę**.",
-            view=view,
-            ephemeral=True
+            "Wybierz graczy (pokazane NICKI). Potem kliknij **Publikuj listę**.",
+            view=view, ephemeral=True
         )
 
-# ---------- AIRDROP: ogłoszenie (z KOLEJKĄ) ----------
+# ===== [CAPT] Panel – LISTA CAPTURES =====
+class CaptAddInstantView(discord.ui.View):
+    def __init__(self, capt: "CaptView"):
+        super().__init__(timeout=240)
+        self.capt = capt
+        self.user_select = discord.ui.UserSelect(
+            placeholder="Wybierz osoby do LISTY CAPTURES (działa natychmiast)",
+            min_values=1, max_values=25
+        )
+        self.add_item(self.user_select)
+        async def _on_pick(inter: discord.Interaction):
+            await inter.response.defer(ephemeral=True, thinking=False)
+            added = 0
+            names = []
+            for u in self.user_select.values:
+                if u.id not in self.capt.picked_list:
+                    self.capt.picked_list.append(u.id); added += 1
+                names.append(f"- {getattr(u, 'display_name', getattr(u, 'name', ''))}")
+            await self.capt.refresh_pick_embed(inter.channel, inter.user)
+            await inter.followup.send(f"✅ Dodano do **listy CAPTURES**: **{added}**.\n" + ("\n".join(names) if names else ""), ephemeral=True)
+        self.user_select.callback = _on_pick
+    @discord.ui.button(label="Zamknij", style=discord.ButtonStyle.secondary)
+    async def close_btn(self, interaction: discord.Interaction, _: discord.ui.Button):
+        await interaction.response.edit_message(content="Zamknięto.", view=None)
+
+class CaptRemoveInstantView(discord.ui.View):
+    def __init__(self, capt: "CaptView"):
+        super().__init__(timeout=240)
+        self.capt = capt
+        if not capt.picked_list:
+            self.add_item(discord.ui.Button(label="Lista CAPTURES jest pusta", style=discord.ButtonStyle.secondary, disabled=True))
+            return
+        options = []
+        for uid in capt.picked_list[:25]:
+            m = capt.guild.get_member(uid)
+            label = (m.display_name if m else f"User {uid}")[:100]
+            desc  = (f"@{m.name}" if m else f"ID {uid}")[:100]
+            options.append(discord.SelectOption(label=label, value=str(uid), description=desc))
+        self.sel = discord.ui.Select(
+            placeholder="Zaznacz osoby do usunięcia z LISTY CAPTURES (instant)",
+            min_values=1, max_values=len(options), options=options
+        )
+        self.add_item(self.sel)
+        async def _on_remove(inter: discord.Interaction):
+            await inter.response.defer(ephemeral=True, thinking=False)
+            chosen = [int(v) for v in self.sel.values]
+            removed_names = []
+            before = set(self.capt.picked_list)
+            self.capt.picked_list = [uid for uid in self.capt.picked_list if uid not in chosen]
+            for uid in chosen:
+                m = self.capt.guild.get_member(uid)
+                removed_names.append(f"- {m.display_name if m else f'ID {uid}'}")
+            removed = len(before) - len(set(self.capt.picked_list))
+            await self.capt.refresh_pick_embed(inter.channel, inter.user)
+            await inter.followup.send(f"✅ Usunięto z **listy CAPTURES**: **{removed}**.\n" + ("\n".join(removed_names) if removed_names else ""), ephemeral=True)
+        self.sel.callback = _on_remove
+    @discord.ui.button(label="Zamknij", style=discord.ButtonStyle.secondary)
+    async def close_btn(self, interaction: discord.Interaction, _: discord.ui.Button):
+        await interaction.response.edit_message(content="Zamknięto.", view=None)
+
+class PanelView(discord.ui.View):
+    def __init__(self, capt: "CaptView", opener: discord.Member):
+        super().__init__(timeout=600)
+        self.capt = capt
+        self.opener = opener
+    @discord.ui.button(label="Dodaj do listy CAPTURES", style=discord.ButtonStyle.success)
+    async def add_btn(self, interaction: discord.Interaction, _: discord.ui.Button):
+        await interaction.response.send_message("Wybierz osoby do **listy CAPTURES**:", view=CaptAddInstantView(self.capt), ephemeral=True)
+    @discord.ui.button(label="Usuń z listy CAPTURES", style=discord.ButtonStyle.danger)
+    async def rem_btn(self, interaction: discord.Interaction, _: discord.ui.Button):
+        await interaction.response.send_message("Zaznacz osoby do **usunięcia z listy CAPTURES**:", view=CaptRemoveInstantView(self.capt), ephemeral=True)
+    @discord.ui.button(label="Pokaż listę zapisanych", style=discord.ButtonStyle.secondary)
+    async def show_btn(self, interaction: discord.Interaction, _: discord.ui.Button):
+        if not self.capt.users:
+            return await interaction.response.send_message("Brak zapisanych.", ephemeral=True)
+        lines = format_numbered_users(self.capt.users, self.capt.guild)
+        parts = chunk_lines(lines, 1800)
+        await interaction.response.send_message(f"**Lista zapisanych (część 1):**\n{parts[0]}", ephemeral=True)
+        for i, p in enumerate(parts[1:], start=2):
+            await interaction.followup.send(f"**Lista zapisanych (część {i}):**\n{p}", ephemeral=True)
+
+# ---------- AIRDROP: PICK (max 20) ----------
+class AirdropPickView(discord.ui.View):
+    def __init__(self, adr: "AirdropView", option_rows: list[tuple[int, str, str | None]], picker: discord.Member):
+        super().__init__(timeout=300)
+        self.adr = adr
+        self.picker = picker
+        options = []
+        for idx, (uid, nick, desc) in enumerate(option_rows, start=1):
+            options.append(discord.SelectOption(label=(f"{idx}. {nick}")[:100], value=str(uid), description=(desc or f"ID {uid}")[:100]))
+        max_vals = min(20, len(options)) or 1
+        self.sel = discord.ui.Select(placeholder="Wybierz osoby (max 20)", min_values=0, max_values=max_vals, options=options)
+        self.add_item(self.sel)
+        async def _on_select(inter: discord.Interaction):
+            chosen_ids = [int(v) for v in self.sel.values]
+            if not chosen_ids:
+                txt = "Nic nie zaznaczono. Kliknij **Publikuj Wytypowanych**."
+            else:
+                lines = []
+                for i, uid in enumerate(chosen_ids, start=1):
+                    m = adr.guild.get_member(uid)
+                    lines.append(f"{i}. {m.display_name if m else f'User {uid}'}")
+                txt = f"Zaznaczono {len(chosen_ids)}:\n" + "\n".join(lines)
+            await inter.response.edit_message(content=txt, view=self)
+        self.sel.callback = _on_select
+    @discord.ui.button(label="Publikuj Wytypowanych", style=discord.ButtonStyle.success)
+    async def publish(self, interaction: discord.Interaction, _: discord.ui.Button):
+        chosen = [int(v) for v in self.sel.values]
+        if not chosen:
+            return await interaction.response.edit_message(content="Nie wybrałeś żadnych osób.", view=self)
+        self.adr.picked_list = list(dict.fromkeys(self.adr.picked_list + chosen))
+        await self.adr.refresh_picked_embed(interaction.channel, interaction.user)
+        await interaction.response.edit_message(content="Opublikowano/odświeżono listę **Wytypowani na AirDrop!**", view=self)
+    @discord.ui.button(label="Anuluj", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, _: discord.ui.Button):
+        await interaction.response.edit_message(content="Anulowano wybór.", view=None)
+        self.stop()
+
+# ---------- AIRDROP: ogłoszenie ----------
 class AirdropView(discord.ui.View):
     def __init__(self, starts_at: datetime, guild: discord.Guild, author: discord.Member,
                  info_text: str, voice: discord.VoiceChannel | None, max_slots: int):
@@ -381,10 +526,13 @@ class AirdropView(discord.ui.View):
         self.info_text = info_text
         self.voice = voice
         self.max_slots = max(0, int(max_slots or 0))  # 0 = bez limitu
-        self.users: list[int] = []
-        self.queue: list[int] = []
+        self.users: list[int] = []   # zapisani
+        self.queue: list[int] = []   # kolejka (gdy limit)
+        self.picked_list: list[int] = []  # WYTYPOWANI (drugi embed)
         self.message: discord.Message | None = None
+        self.picked_message: discord.Message | None = None
         self._lock = asyncio.Lock()
+
         if self.max_slots <= 0:
             for item in list(self.children):
                 if isinstance(item, discord.ui.Button) and item.label == "Dołącz do kolejki":
@@ -399,11 +547,21 @@ class AirdropView(discord.ui.View):
                 item.disabled = is_full
             if isinstance(item, discord.ui.Button) and item.label == "Dołącz do kolejki":
                 item.disabled = (self.max_slots <= 0)
-        emb = make_airdrop_embed(
-            self.starts_at, self.users, self.guild, self.author,
-            self.info_text, self.voice, self.max_slots, len(self.queue)
-        )
+        emb = make_airdrop_embed(self.starts_at, self.users, self.guild, self.author, self.info_text, self.voice, self.max_slots, len(self.queue))
         await self.message.edit(embed=emb, view=self)
+
+    async def refresh_picked_embed(self, channel: discord.abc.Messageable, picker: discord.Member | None):
+        emb = make_airdrop_picked_embed(self.picked_list, self.guild, picker or self.author)
+        if self.picked_message:
+            try:
+                await self.picked_message.edit(embed=emb)
+                return
+            except Exception:
+                self.picked_message = None
+        try:
+            self.picked_message = await channel.send(embed=emb)
+        except Exception:
+            pass
 
     @discord.ui.button(label="Dołącz", style=discord.ButtonStyle.success)
     async def join(self, interaction: discord.Interaction, _: discord.ui.Button):
@@ -413,22 +571,13 @@ class AirdropView(discord.ui.View):
                 added = False
             else:
                 if self.max_slots > 0 and len(self.users) >= self.max_slots:
-                    await interaction.response.send_message(
-                        f"Limit miejsc osiągnięty ({self.max_slots}). Użyj **Dołącz do kolejki**.",
-                        ephemeral=True
-                    )
+                    await interaction.response.send_message(f"Limit miejsc osiągnięty ({self.max_slots}). Użyj **Dołącz do kolejki**.", ephemeral=True)
                     return
                 self.users.append(uid)
                 if uid in self.queue:
                     self.queue.remove(uid)
-                added = True
-        await interaction.response.defer(ephemeral=True)
+        await interaction.response.send_message("Dołączono.", ephemeral=True)
         await self.refresh_embed()
-        if added:
-            try:
-                await interaction.followup.send("Dołączono do AirDrop.", ephemeral=True)
-            except Exception:
-                pass
 
     @discord.ui.button(label="Opuść", style=discord.ButtonStyle.danger)
     async def leave(self, interaction: discord.Interaction, _: discord.ui.Button):
@@ -439,9 +588,12 @@ class AirdropView(discord.ui.View):
                 self.users.remove(uid); changed = True
             if uid in self.queue:
                 self.queue.remove(uid); changed = True
-        await interaction.response.defer(ephemeral=True)
+            if uid in self.picked_list:
+                self.picked_list.remove(uid); changed = True
+        await interaction.response.send_message("Zaktualizowano.", ephemeral=True)
         if changed:
             await self.refresh_embed()
+            await self.refresh_picked_embed(interaction.channel, interaction.user)
 
     @discord.ui.button(label="Dołącz do kolejki", style=discord.ButtonStyle.primary)
     async def join_queue(self, interaction: discord.Interaction, _: discord.ui.Button):
@@ -457,207 +609,90 @@ class AirdropView(discord.ui.View):
             if uid in self.queue:
                 await interaction.response.send_message("Jesteś już w kolejce.", ephemeral=True); return
             self.queue.append(uid)
-        await interaction.response.defer(ephemeral=True)
+        await interaction.response.send_message("Dodano do kolejki.", ephemeral=True)
         await self.refresh_embed()
-        try:
-            await interaction.followup.send("Dodano do kolejki.", ephemeral=True)
-        except Exception:
-            pass
 
-# ---------- PANELE CAPT (ZAPISANI + WYBRANI) ----------
-class CaptAddSignupsView(discord.ui.View):
-    def __init__(self, capt: CaptView):
-        super().__init__(timeout=240)
-        self.capt = capt
-        self.sel = discord.ui.UserSelect(placeholder="Dodaj do ZAPISANYCH (max 25)", min_values=1, max_values=25)
-        self.add_item(self.sel)
-        async def _cb(inter: discord.Interaction):
-            added = 0
-            for user in self.sel.values:
-                uid = user.id
-                if uid not in self.capt.users:
-                    self.capt.users.append(uid); added += 1
-            await self.capt.refresh_announce()
-            await self.capt.refresh_pick_embed(inter.channel, inter.user)
-            await inter.response.edit_message(content=f"Dodano: {added}. Zapisanych: {len(self.capt.users)}", view=self)
-        self.sel.callback = _cb
+    @discord.ui.button(label="PICK", style=discord.ButtonStyle.secondary)
+    async def pick_from_signups(self, interaction: discord.Interaction, _: discord.ui.Button):
+        if not self.users:
+            await interaction.response.send_message("Brak zapisanych.", ephemeral=True)
+            return
+        option_rows = []
+        for uid in self.users[:20]:
+            m = self.guild.get_member(uid)
+            nick = m.display_name if m else f"User {uid}"
+            desc = f"@{m.name}" if m else f"ID {uid}"
+            option_rows.append((uid, nick, desc))
+        view = AirdropPickView(self, option_rows, interaction.user)
+        await interaction.response.send_message(
+            "Wybierz osoby z **zapisanych** (**max 20**) do wytypowania. Następnie kliknij **Publikuj Wytypowanych**.",
+            view=view, ephemeral=True
+        )
 
-class CaptRemoveSignupsView(discord.ui.View):
-    def __init__(self, capt: CaptView):
-        super().__init__(timeout=240)
-        self.capt = capt
-        if not capt.users:
-            self.add_item(discord.ui.Button(label="Brak zapisanych", style=discord.ButtonStyle.secondary, disabled=True)); return
-        options = []
-        for uid in capt.users[:25]:
-            m = capt.guild.get_member(uid)
-            label = (m.display_name if m else f"User {uid}")[:100]
-            desc  = (f"@{m.name}" if m else f"ID {uid}")[:100]
-            options.append(discord.SelectOption(label=label, value=str(uid), description=desc, default=True))
-        self.sel = discord.ui.Select(placeholder="Odznacz, aby usunąć (ZAPISANI) – max 25",
-                                     min_values=0, max_values=len(options), options=options)
-        self.add_item(self.sel)
-        async def _cb(inter: discord.Interaction):
-            keep_ids = {int(v) for v in self.sel.values}
-            before = list(self.capt.users)
-            self.capt.users = [uid for uid in before if uid in keep_ids]
-            removed = len(before) - len(self.capt.users)
-            self.capt.picked_list = [uid for uid in self.capt.picked_list if uid in self.capt.users]
-            await self.capt.refresh_announce()
-            await self.capt.refresh_pick_embed(inter.channel, inter.user)
-            await inter.response.edit_message(content=f"Usunięto: {removed}. Zapisanych: {len(self.capt.users)}", view=self)
-        self.sel.callback = _cb
-
-class AddToPickedView(discord.ui.View):
-    def __init__(self, capt: CaptView):
-        super().__init__(timeout=240)
-        self.capt = capt
-        self.sel = discord.ui.UserSelect(placeholder="Dodaj do WYBRANI (max 25)", min_values=1, max_values=25)
-        self.add_item(self.sel)
-        async def _cb(inter: discord.Interaction):
-            added = 0
-            for user in self.sel.values:
-                uid = user.id
-                if uid not in self.capt.picked_list:
-                    self.capt.picked_list.append(uid); added += 1
-            await self.capt.refresh_pick_embed(inter.channel, inter.user)
-            await inter.response.edit_message(content=f"Dodano do WYBRANI: {added}. Na liście: {len(self.capt.picked_list)}", view=self)
-        self.sel.callback = _cb
-
-class RemoveFromPickedView(discord.ui.View):
-    def __init__(self, capt: CaptView):
-        super().__init__(timeout=240)
-        self.capt = capt
-        if not capt.picked_list:
-            self.add_item(discord.ui.Button(label="Lista WYBRANI jest pusta", style=discord.ButtonStyle.secondary, disabled=True)); return
-        options = []
-        for uid in capt.picked_list[:25]:
-            m = capt.guild.get_member(uid)
-            label = (m.display_name if m else f"User {uid}")[:100]
-            desc  = (f"@{m.name}" if m else f"ID {uid}")[:100]
-            options.append(discord.SelectOption(label=label, value=str(uid), description=desc, default=True))
-        self.sel = discord.ui.Select(placeholder="Odznacz, aby usunąć (WYBRANI) – max 25",
-                                     min_values=0, max_values=len(options), options=options)
-        self.add_item(self.sel)
-        async def _cb(inter: discord.Interaction):
-            keep_ids = {int(v) for v in self.sel.values}
-            before = list(self.capt.picked_list)
-            self.capt.picked_list = [uid for uid in before if uid in keep_ids]
-            removed = len(before) - len(self.capt.picked_list)
-            await self.capt.refresh_pick_embed(inter.channel, inter.user)
-            await inter.response.edit_message(content=f"Usunięto z WYBRANI: {removed}. Na liście: {len(self.capt.picked_list)}", view=self)
-        self.sel.callback = _cb
-
-class RandomPickModal(discord.ui.Modal, title="Losuj do listy (WYBRANI)"):
-    def __init__(self, capt: CaptView):
-        super().__init__(timeout=120)
-        self.capt = capt
-        self.count = discord.ui.TextInput(label="Ile osób dodać?", placeholder="np. 10", required=True, max_length=3)
-        self.add_item(self.count)
-    async def on_submit(self, interaction: discord.Interaction):
-        try:
-            n = int(str(self.count.value).strip()); assert n > 0
-        except Exception:
-            await interaction.response.send_message("Podaj poprawną liczbę > 0.", ephemeral=True); return
-        pool = [uid for uid in self.capt.users if uid not in self.capt.picked_list]
-        if not pool:
-            await interaction.response.send_message("Brak dostępnych osób do losowania.", ephemeral=True); return
-        chosen = random.sample(pool, k=min(n, len(pool)))
-        for uid in chosen:
-            if uid not in self.capt.picked_list:
-                self.capt.picked_list.append(uid)
-        await self.capt.refresh_pick_embed(interaction.channel, interaction.user)
-        await interaction.response.send_message(f"Wylosowano {len(chosen)}. Na liście WYBRANI: {len(self.capt.picked_list)}.", ephemeral=True)
-
-class PanelView(discord.ui.View):
-    def __init__(self, capt: CaptView, opener: discord.Member):
-        super().__init__(timeout=600)
-        self.capt = capt
-        self.opener = opener
-    @discord.ui.button(label="Dodaj do ZAPISANYCH", style=discord.ButtonStyle.success)
-    async def add_signed_btn(self, interaction: discord.Interaction, _: discord.ui.Button):
-        view = CaptAddSignupsView(self.capt)
-        await interaction.response.send_message("Wybierz osoby do **dodania** (ZAPISANI):", view=view, ephemeral=True)
-    @discord.ui.button(label="Usuń z ZAPISANYCH (odznacz)", style=discord.ButtonStyle.danger)
-    async def del_signed_btn(self, interaction: discord.Interaction, _: discord.ui.Button):
-        view = CaptRemoveSignupsView(self.capt)
-        await interaction.response.send_message("Odznacz osoby do **usunięcia** (ZAPISANI):", view=view, ephemeral=True)
-    @discord.ui.button(label="Dodaj do WYBRANI", style=discord.ButtonStyle.secondary)
-    async def add_pick_btn(self, interaction: discord.Interaction, _: discord.ui.Button):
-        view = AddToPickedView(self.capt)
-        await interaction.response.send_message("Wybierz osoby do **dodania** (WYBRANI):", view=view, ephemeral=True)
-    @discord.ui.button(label="Usuń z WYBRANI (odznacz)", style=discord.ButtonStyle.secondary)
-    async def del_pick_btn(self, interaction: discord.Interaction, _: discord.ui.Button):
-        view = RemoveFromPickedView(self.capt)
-        await interaction.response.send_message("Odznacz osoby do **usunięcia** (WYBRANI):", view=view, ephemeral=True)
-    @discord.ui.button(label="Losuj do WYBRANI", style=discord.ButtonStyle.primary)
-    async def rnd_btn(self, interaction: discord.Interaction, _: discord.ui.Button):
-        modal = RandomPickModal(self.capt)
-        await interaction.response.send_modal(modal)
-
-# ---------- PANELE AIRDROP ----------
-class AirdropAddSignupsView(discord.ui.View):
-    def __init__(self, adr: AirdropView):
+# ===== [PATCH] AIRDROP – instant dod/usuń WYTYPOWANYCH =====
+class AirdropAddAnyView(discord.ui.View):
+    def __init__(self, adr: "AirdropView"):
         super().__init__(timeout=240)
         self.adr = adr
-        self.sel = discord.ui.UserSelect(placeholder="Dodaj do zapisanych (max 25)", min_values=1, max_values=25)
-        self.add_item(self.sel)
-        async def _cb(inter: discord.Interaction):
-            added = 0; skipped_full = 0
-            for user in self.sel.values:
-                uid = user.id
-                if uid in self.adr.users: continue
-                if self.adr.max_slots > 0 and len(self.adr.users) >= self.adr.max_slots:
-                    skipped_full += 1; continue
-                self.adr.users.append(uid)
-                if uid in self.adr.queue: self.adr.queue.remove(uid)
-                added += 1
-            await self.adr.refresh_embed()
-            note = (f" (pełno miejsc, pominięto: {skipped_full})" if skipped_full else "")
-            queue_part = (f" • Kolejka: {len(self.adr.queue)}" if self.adr.max_slots else "")
-            await inter.response.edit_message(
-                content=f"Dodano: {added}. Zapisanych: {len(self.adr.users)}"
-                        + (f" / {self.adr.max_slots}" if self.adr.max_slots else "")
-                        + queue_part + note,
-                view=self
-            )
-        self.sel.callback = _cb
+        self.user_select = discord.ui.UserSelect(
+            placeholder="Wybierz osoby do WYTYPOWANYCH (działa natychmiast)",
+            min_values=1, max_values=25
+        )
+        self.add_item(self.user_select)
+        async def _on_pick(inter: discord.Interaction):
+            await inter.response.defer(ephemeral=True, thinking=False)
+            chosen = list(self.user_select.values)
+            added = 0
+            names = []
+            for u in chosen:
+                if u.id not in self.adr.picked_list:
+                    self.adr.picked_list.append(u.id); added += 1
+                names.append(f"- {getattr(u,'display_name', getattr(u,'name',''))}")
+            await self.adr.refresh_picked_embed(inter.channel, inter.user)
+            await inter.followup.send(f"✅ Dodano do WYTYPOWANYCH: **{added}**.\n" + ("\n".join(names) if names else ""), ephemeral=True)
+        self.user_select.callback = _on_pick
+    @discord.ui.button(label="Zamknij", style=discord.ButtonStyle.secondary)
+    async def close_btn(self, interaction: discord.Interaction, _: discord.ui.Button):
+        await interaction.response.edit_message(content="Zamknięto.", view=None)
 
-class AirdropRemoveSignupsView(discord.ui.View):
-    def __init__(self, adr: AirdropView):
+class AirdropRemovePickedView(discord.ui.View):
+    def __init__(self, adr: "AirdropView"):
         super().__init__(timeout=240)
         self.adr = adr
-        if not adr.users:
-            self.add_item(discord.ui.Button(label="Brak zapisanych", style=discord.ButtonStyle.secondary, disabled=True)); return
+        if not adr.picked_list:
+            self.add_item(discord.ui.Button(label="Lista WYTYPOWANYCH pusta", style=discord.ButtonStyle.secondary, disabled=True))
+            return
         options = []
-        for uid in adr.users[:25]:
+        for uid in adr.picked_list[:25]:
             m = adr.guild.get_member(uid)
-            label = (m.display_name if m else f"User {uid}")[:100]
-            desc  = (f"@{m.name}" if m else f"ID {uid}")[:100]
-            options.append(discord.SelectOption(label=label, value=str(uid), description=desc, default=True))
-        self.sel = discord.ui.Select(placeholder="Odznacz, aby usunąć (max 25)",
-                                     min_values=0, max_values=len(options), options=options)
+            options.append(discord.SelectOption(label=(m.display_name if m else f"User {uid}")[:100],
+                                               value=str(uid),
+                                               description=(f"@{m.name}" if m else f"ID {uid}")[:100]))
+        self.sel = discord.ui.Select(
+            placeholder="Zaznacz osoby do usunięcia (działa natychmiast)",
+            min_values=1, max_values=len(options), options=options
+        )
         self.add_item(self.sel)
-        async def _cb(inter: discord.Interaction):
-            keep_ids = {int(v) for v in self.sel.values}
-            before = list(self.adr.users)
-            self.adr.users = [uid for uid in before if uid in keep_ids]
-            removed = len(before) - len(self.adr.users)
-            await self.adr.refresh_embed()
-            queue_part = (f" • Kolejka: {len(self.adr.queue)}" if self.adr.max_slots else "")
-            await inter.response.edit_message(
-                content=(
-                    f"Usunięto: {removed}. Zapisanych: {len(self.adr.users)}"
-                    + (f" / {self.adr.max_slots}" if self.adr.max_slots else "")
-                    + queue_part
-                ),
-                view=self
-            )
-        self.sel.callback = _cb
+        async def _on_remove(inter: discord.Interaction):
+            await inter.response.defer(ephemeral=True, thinking=False)
+            chosen = [int(v) for v in self.sel.values]
+            removed_names = []
+            for uid in chosen:
+                m = self.adr.guild.get_member(uid)
+                removed_names.append(f"- {m.display_name if m else f'ID {uid}'}")
+            before = set(self.adr.picked_list)
+            self.adr.picked_list = [uid for uid in self.adr.picked_list if uid not in chosen]
+            removed = len(before) - len(set(self.adr.picked_list))
+            await self.adr.refresh_picked_embed(inter.channel, inter.user)
+            await inter.followup.send(f"✅ Usunięto z WYTYPOWANYCH: **{removed}**.\n" + ("\n".join(removed_names) if removed_names else ""), ephemeral=True)
+        self.sel.callback = _on_remove
+    @discord.ui.button(label="Zamknij", style=discord.ButtonStyle.secondary)
+    async def close_btn(self, interaction: discord.Interaction, _: discord.ui.Button):
+        await interaction.response.edit_message(content="Zamknięto.", view=None)
 
-class AirdropWinnersModal(discord.ui.Modal):
-    def __init__(self, adr: AirdropView):
-        super().__init__(title=("Losuj zwycięzców (z kolejki)" if adr.max_slots > 0 else "Losuj zwycięzców (z zapisanych)"))
+class AirdropWinnersModal(discord.ui.Modal, title="Losuj z kolejki"):
+    def __init__(self, adr: "AirdropView"):
+        super().__init__(timeout=180)
         self.adr = adr
         self.count = discord.ui.TextInput(label="Ile osób wylosować?", placeholder="np. 5", required=True, max_length=3)
         self.add_item(self.count)
@@ -665,36 +700,42 @@ class AirdropWinnersModal(discord.ui.Modal):
         try:
             n = int(str(self.count.value).strip()); assert n > 0
         except Exception:
-            await interaction.response.send_message("Podaj poprawną liczbę > 0.", ephemeral=True); return
-        from_queue = self.adr.max_slots > 0
-        pool = list(self.adr.queue) if from_queue else list(self.adr.users)
+            return await interaction.response.send_message("Podaj poprawną liczbę > 0.", ephemeral=True)
+        pool = list(self.adr.queue)
         if not pool:
-            await interaction.response.send_message("Brak osób do losowania w wybranej puli.", ephemeral=True); return
+            return await interaction.response.send_message("Kolejka jest pusta.", ephemeral=True)
         winners = random.sample(pool, k=min(n, len(pool)))
-        emb = make_airdrop_winners_embed(winners, self.adr.guild, interaction.user, from_queue=from_queue)
-        await interaction.response.send_message("Wyniki losowania opublikowane poniżej.", ephemeral=True)
-        await interaction.channel.send(embed=emb)
+        for uid in winners:
+            if uid not in self.adr.picked_list:
+                self.adr.picked_list.append(uid)
+        await self.adr.refresh_picked_embed(interaction.channel, interaction.user)
+        await interaction.response.send_message("Wylosowano i dodano do **Wytypowanych** (z kolejki).", ephemeral=True)
 
 class AirdropPanelView(discord.ui.View):
     def __init__(self, adr: AirdropView, opener: discord.Member):
         super().__init__(timeout=600)
-        self.adr = adr; self.opener = opener
-        try:
-            if self.adr.max_slots > 0: self.winners_btn.label = "Losuj z kolejki"
-            else: self.winners_btn.label = "Losuj z zapisanych"
-        except Exception: pass
-    @discord.ui.button(label="Dodaj do zapisanych", style=discord.ButtonStyle.success)
-    async def add_btn(self, interaction: discord.Interaction, _: discord.ui.Button):
-        view = AirdropAddSignupsView(self.adr)
-        await interaction.response.send_message("Wybierz osoby do **dodania** na listę zapisanych:", view=view, ephemeral=True)
-    @discord.ui.button(label="Usuń z zapisanych (odznacz)", style=discord.ButtonStyle.danger)
-    async def del_btn(self, interaction: discord.Interaction, _: discord.ui.Button):
-        view = AirdropRemoveSignupsView(self.adr)
-        await interaction.response.send_message("Odznacz osoby do **usunięcia** z listy zapisanych:", view=view, ephemeral=True)
-    @discord.ui.button(label="Losuj", style=discord.ButtonStyle.primary)
+        self.adr = adr
+        self.opener = opener
+    @discord.ui.button(label="Dodaj do WYTYPOWANYCH", style=discord.ButtonStyle.success)
+    async def add_any(self, interaction: discord.Interaction, _: discord.ui.Button):
+        await interaction.response.send_message("Wybierz osoby z **całego serwera** do dodania:",
+                                                view=AirdropAddAnyView(self.adr), ephemeral=True)
+    @discord.ui.button(label="Usuń z WYTYPOWANYCH", style=discord.ButtonStyle.danger)
+    async def rem_picked(self, interaction: discord.Interaction, _: discord.ui.Button):
+        await interaction.response.send_message("Zaznacz osoby do **usunięcia** z WYTYPOWANYCH:",
+                                                view=AirdropRemovePickedView(self.adr), ephemeral=True)
+    @discord.ui.button(label="Pokaż listę zapisanych", style=discord.ButtonStyle.secondary, row=1)
+    async def show_signed(self, interaction: discord.Interaction, _: discord.ui.Button):
+        if not self.adr.users:
+            return await interaction.response.send_message("Brak zapisanych.", ephemeral=True)
+        lines = format_numbered_users(self.adr.users, interaction.guild)
+        parts = chunk_lines(lines, max_chars=1800)
+        await interaction.response.send_message(f"**Lista zapisanych (część 1):**\n{parts[0]}", ephemeral=True)
+        for idx, p in enumerate(parts[1:], start=2):
+            await interaction.followup.send(f"**Lista zapisanych (część {idx}):**\n{p}", ephemeral=True)
+    @discord.ui.button(label="Losuj z kolejki", style=discord.ButtonStyle.primary)
     async def winners_btn(self, interaction: discord.Interaction, _: discord.ui.Button):
-        modal = AirdropWinnersModal(self.adr)
-        await interaction.response.send_modal(modal)
+        await interaction.response.send_modal(AirdropWinnersModal(self.adr))
 
 # ===== Komendy podstawowe =====
 @bot.tree.command(name="ping", description="Sprawdź opóźnienie bota.")
@@ -707,7 +748,7 @@ async def ping(interaction: discord.Interaction):
 async def say(interaction: discord.Interaction, text: str):
     await interaction.response.send_message(text)
 
-# ===== CREATE CAPT (z @everyone) =====
+# ===== CREATE CAPT =====
 @bot.tree.command(name="create-capt", description="Utwórz CAPT z odliczaniem, zdjęciem i pingiem @everyone.")
 @role_required_check()
 @app_commands.describe(start_time="Godzina startu 24h, np. 15:40 (czas Polski).",
@@ -759,18 +800,18 @@ async def panel_capt(interaction: discord.Interaction):
     key = (interaction.guild.id, interaction.channel.id)
     capt = ACTIVE_CAPTS.get(key)
     if not capt or not capt.message:
-        await interaction.response.send_message("Brak aktywnego ogłoszenia w tym kanale.", ephemeral=True); return
+        return await interaction.response.send_message("Brak aktywnego ogłoszenia w tym kanale.", ephemeral=True)
     mem: discord.Member = interaction.user
-    if not (mem.guild_permissions.administrator or mem == capt.author):
-        await interaction.response.send_message("Panel dostępny tylko dla wystawiającego lub administratora.", ephemeral=True); return
+    if not (mem.guild_permissions.administrator or mem == capt.author or any(r.id == REQUIRED_ROLE_ID for r in mem.roles)):
+        return await interaction.response.send_message("Panel dostępny dla wystawiającego, administratora lub roli uprawnionej.", ephemeral=True)
     view = PanelView(capt, mem)
     await interaction.response.send_message(
-        f"Panel CAPT – Zapisani: **{len(capt.users)}**, WYBRANI: **{len(capt.picked_list)}**.",
+        f"Panel CAPT – zapisanych: **{len(capt.users)}**, WYBRANI: **{len(capt.picked_list)}**.",
         view=view, ephemeral=True
     )
 
-# ===== AIRDROP (zawsze @everyone) =====
-@bot.tree.command(name="airdrop", description="Utwórz AirDrop (opis, głosowy, timer, zapisy; opcjonalny limit miejsc i kolejka).")
+# ===== AIRDROP =====
+@bot.tree.command(name="airdrop", description="Utwórz AirDrop (opis, głosowy, timer, licznik; opcjonalny limit i kolejka).")
 @role_required_check()
 @app_commands.describe(
     info_text="Tekst w opisie (np. zasady/uwagi).",
@@ -819,25 +860,25 @@ async def airdrop(interaction: discord.Interaction, info_text: str, voice: disco
     interaction.client.loop.create_task(ticker())
 
 # ===== PANEL AIRDROP =====
-@bot.tree.command(name="panel-airdrop", description="Otwórz panel AIRDROP w tym kanale.")
+@bot.tree.command(name="panel-airdrop", description="Otwórz panel AIRDROP w tym kanale (zarządza WYTYPOWANYMI).")
 @role_required_check()
 async def panel_airdrop(interaction: discord.Interaction):
     key = (interaction.guild.id, interaction.channel.id)
     adr = ACTIVE_AIRDROPS.get(key)
     if not adr or not adr.message:
-        await interaction.response.send_message("Brak aktywnego airdropa w tym kanale.", ephemeral=True); return
+        return await interaction.response.send_message("Brak aktywnego airdropa w tym kanale.", ephemeral=True)
     mem: discord.Member = interaction.user
-    if not (mem.guild_permissions.administrator or mem == adr.author):
-        await interaction.response.send_message("Panel dostępny tylko dla wystawiającego lub administratora.", ephemeral=True); return
+    if not (mem.guild_permissions.administrator or mem == adr.author or any(r.id == REQUIRED_ROLE_ID for r in mem.roles)):
+        return await interaction.response.send_message("Panel dostępny dla wystawiającego, administratora lub roli uprawnionej.", ephemeral=True)
     view = AirdropPanelView(adr, mem)
     lim = f" / {adr.max_slots}" if adr.max_slots else ""
     queue_info = f", kolejka: **{len(adr.queue)}**" if adr.max_slots else ""
     await interaction.response.send_message(
-        f"Panel AIRDROP – zapisanych: **{len(adr.users)}{lim}**{queue_info}.",
+        f"Panel AIRDROP – zapisanych: **{len(adr.users)}{lim}**{queue_info}. WYTYPOWANI: **{len(adr.picked_list)}**.",
         view=view, ephemeral=True
     )
 
-# ===== PINGI: Cayo i Zancudo =====
+# ====== PINGI: Cayo i Zancudo ======
 def _parse_pl_time(start_time: str) -> datetime:
     try:
         hh, mm = (int(x) for x in start_time.strip().split(":"))
@@ -914,7 +955,7 @@ async def set_status(interaction: discord.Interaction,
                      text: str,
                      presence: app_commands.Choice[str] = None,
                      stream_url: str = ""):
-    await interaction.response.defer(ephemeral=True)
+    await interaction.response.send_message("Zmieniam status…", ephemeral=True)
     kind = activity_type.value
     status = _presence_from_choice(presence.value) if presence else discord.Status.online
     if kind == "streaming":
@@ -979,15 +1020,15 @@ class SquadModal(discord.ui.Modal, title='Edytuj Skład'):
         )
         self.add_item(self.list_input)
     async def on_submit(self, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=True)
+        await interaction.response.send_message("Aktualizuję skład…", ephemeral=True)
         new_members_list = self.list_input.value
         squad_data = SQUADS.get(self.message_id)
         if not squad_data:
             return await interaction.followup.send("Błąd: Nie znaleziono danych tego składu.", ephemeral=True)
-        squad_data["members_list"] = new_members_list
         message = squad_data.get("message")
         author_name = squad_data.get("author_name", "Bot")
         title = message.embeds[0].title if (message and message.embeds) else "Main Squad"
+        SQUADS[self.message_id]["members_list"] = new_members_list
         new_embed = create_squad_embed(interaction.guild, author_name, new_members_list, title)
         if message:
             view = SquadView(self.message_id, squad_data.get("role_id"))
@@ -1007,7 +1048,6 @@ class SquadView(discord.ui.View):
     async def manage_squad_button(self, interaction: discord.Interaction, _: discord.ui.Button):
         m: discord.Member = interaction.user
         is_admin = (m.guild_permissions.administrator or m == m.guild.owner
-                    or (ADMIN_USER_IDS and m.id in ADMIN_USER_IDS)
                     or (REQUIRED_ROLE_ID and any(r.id == REQUIRED_ROLE_ID for r in m.roles)))
         if not is_admin:
             return await interaction.response.send_message("⛔ Brak uprawnień do zarządzania składem!", ephemeral=True)
@@ -1018,15 +1058,15 @@ class SquadView(discord.ui.View):
         await interaction.response.send_modal(SquadModal(self.message_id, current_content))
 
 @bot.tree.command(name="create-squad", description="Tworzy ogłoszenie o składzie z możliwością edycji.")
+@role_required_check()
 async def create_squad(interaction: discord.Interaction, rola: discord.Role, tytul: str = "Main Squad"):
     try:
         m: discord.Member = interaction.user
         is_admin = (m.guild_permissions.administrator or m == interaction.guild.owner
-                    or (ADMIN_USER_IDS and m.id in ADMIN_USER_IDS)
                     or (REQUIRED_ROLE_ID and any(r.id == REQUIRED_ROLE_ID for r in m.roles)))
         if not is_admin:
             return await interaction.response.send_message("⛔ Brak uprawnień!", ephemeral=True)
-        await interaction.response.defer(ephemeral=True)
+        await interaction.response.send_message("Tworzę ogłoszenie o składzie…", ephemeral=True)
         author_name = m.display_name
         role_id = rola.id
         initial_members = "1- [Wpisz osobę]\n2- [Wpisz osobę]\n3- [Wpisz osobę]"
@@ -1048,33 +1088,6 @@ async def create_squad(interaction: discord.Interaction, rola: discord.Role, tyt
         else:
             await interaction.response.send_message(f"❌ Błąd w /create-squad: `{e}`", ephemeral=True)
 
-# ====== Healthcheck HTTP (Render + UptimeRobot) ======
-async def _health_ok(request):
-    user = request.app.get('bot_user')
-    txt = "ok" if user else "starting"
-    return web.Response(text=txt)
-
-async def start_health_server(bot_instance):
-    app = web.Application()
-    app['bot_user'] = None
-    app.router.add_get('/', _health_ok)
-    app.router.add_get('/health', _health_ok)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    port = int(os.getenv("PORT", "10000"))  # Render przydziela port w $PORT
-    site = web.TCPSite(runner, host="0.0.0.0", port=port)
-    await site.start()
-    logging.info(f"[health] HTTP listening on 0.0.0.0:{port}")
-    async def _bind_user():
-        while True:
-            try:
-                app['bot_user'] = bot_instance.user
-            except Exception:
-                app['bot_user'] = None
-            await asyncio.sleep(10)
-    asyncio.create_task(_bind_user())
-    return runner
-
 # ===== Start / sync =====
 @bot.event
 async def on_ready():
@@ -1094,17 +1107,11 @@ async def on_ready():
 async def main():
     if not TOKEN:
         raise RuntimeError("Brak DISCORD_TOKEN w .env")
-    # Start HTTP health server (Render/UptimeRobot)
-    health_runner = await start_health_server(bot)
-    # Uruchom bota
-    try:
-        async with bot:
-            await bot.start(TOKEN)
-    finally:
-        try:
-            await health_runner.cleanup()
-        except Exception:
-            pass
+    # Uruchom równolegle health-serwer oraz bota
+    await _setup_http()  # start HTTP na PORT
+    # Bot jako task – gdy bot się zamknie, proces zakończy się
+    bot_task = asyncio.create_task(bot.start(TOKEN))
+    await bot_task
 
 if __name__ == "__main__":
     asyncio.run(main())
