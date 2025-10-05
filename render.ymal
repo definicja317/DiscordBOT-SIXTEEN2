@@ -1,0 +1,16 @@
+services:
+  - type: web                       # web (żeby Render oczekiwał serwera na $PORT)
+    name: discord-bot               # dowolna nazwa
+    env: python
+    plan: free                      # albo starter/paid – jak wolisz
+    region: frankfurt               # blisko PL; możesz zmienić
+    startCommand: bash start.sh
+    autoDeploy: true
+    buildCommand: ""                # Render sam zainstaluje zależności z requirements.txt
+    envVars:
+      - key: DISCORD_TOKEN          # ustaw w Dashboard -> Environment
+        sync: false
+      - key: GUILD_ID               # opcjonalnie: jeśli chcesz sync per-guild
+        sync: false
+      - key: HOST
+        value: 0.0.0.0
