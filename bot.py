@@ -96,7 +96,7 @@ logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("bot")
 
 # ===== Active registries =====
-ACTIVE_CAPTS = {}     # (guild_id, channel_id) -> CaptView
+ACTIVE_CAPTS = {}     # (guild_id, channel_id) -> list[CaptView]
 ACTIVE_AIRDROPS = {}  # (guild_id, channel_id) -> AirdropView
 
 # ===== Permissions check =====
@@ -482,7 +482,15 @@ class CaptView(discord.ui.View):
         if not self.message:
             return
         emb = make_main_embed(self.starts_at, self.users, self.guild, self.author, self.image_url)
-        await self.message.edit(embed=emb, view=self)
+        try:
+            await self.message.edit(embed=emb, view=self)
+        except Exception:
+            try:
+                # Try to re-send as a normal message if previous was an interaction response
+                ch = self.message.channel
+                self.message = await ch.send(embed=emb, view=self)
+            except Exception:
+                pass
 
     async def refresh_pick_embed(self, channel: discord.abc.Messageable, picker: discord.Member):
         if not self.picked_list:
@@ -530,20 +538,6 @@ class CaptView(discord.ui.View):
             await self.refresh_pick_embed(interaction.channel, interaction.user)
 
     
-    @discord.ui.button(label="PICK", style=discord.ButtonStyle.primary)
-    async def pick(self, interaction: discord.Interaction, _: discord.ui.Button):
-        mem: discord.Member = interaction.user
-        if not (mem.guild_permissions.administrator or mem == self.author or (REQUIRED_ROLE_ID and any(r.id == REQUIRED_ROLE_ID for r in mem.roles))):
-            await interaction.response.send_message("Tylko wystawiający / admin / rola uprawniona może wybierać osoby.", ephemeral=True)
-            return
-        if not self.users:
-            await interaction.response.send_message("Nikt się jeszcze nie zapisał.", ephemeral=True)
-            return
-        view = CaptPagedPickView(self, mem)
-        await interaction.response.send_message(
-            "Wybierz graczy z pełnej listy zapisanych (przełączaj strony ◀︎ ▶︎). Maksymalnie 25, potem **Publikuj listę**.",
-            view=view, ephemeral=True
-        )
     @discord.ui.button(label="PICK", style=discord.ButtonStyle.primary)
     async def pick(self, interaction: discord.Interaction, _: discord.ui.Button):
         mem: discord.Member = interaction.user
@@ -953,36 +947,6 @@ class MclSignupModal(discord.ui.Modal):
             pass
 
 class MclAssignLabelModal(discord.ui.Modal, title="Nadaj/edytuj etykietę"):
-    def __init__(self, view: "MclSelectedView", target_user_id: int):
-        super().__init__(timeout=None)
-        self.view = view
-        self.target_user_id = target_user_id
-        existing = view.extra_labels.get(target_user_id, "")
-        self.label_input = discord.ui.TextInput(
-            label="Etykieta (np. caller, flank) – puste aby usunąć",
-            placeholder="np. caller",
-            default=existing,
-            max_length=24,
-            required=False
-        )
-        self.add_item(self.label_input)
-
-    async def on_submit(self, interaction: discord.Interaction):
-        label = str(self.label_input.value or "").strip()
-        if label:
-            self.view.extra_labels[self.target_user_id] = label
-        else:
-            self.view.extra_labels.pop(self.target_user_id, None)
-        await self.view.refresh_selected_embed(interaction.channel, interaction.user)
-        try:
-            await interaction.response.send_message("✅ Zaktualizowano etykietę.", ephemeral=True)
-        except Exception:
-            pass
-
-
-
-
-class MclAssignLabelModal(discord.ui.Modal, title="Nadaj/edytuj etykietę"):
     def __init__(self, sel_view: "MclSelectedView", uid: int):
         super().__init__()
         self.sel_view = sel_view
@@ -1352,7 +1316,14 @@ class MclView(discord.ui.View):
             return
         emb = mcl_make_embed(self.title_text, self.voice, self.start_at, self.tp_at, self.guild, len(self.signups))
         emb.set_footer(text=f"Wystawione przez {self.author.display_name}")
-        await self.message.edit(embed=emb, view=self)
+        try:
+            await self.message.edit(embed=emb, view=self)
+        except Exception:
+            try:
+                ch = self.message.channel
+                self.message = await ch.send(embed=emb, view=self)
+            except Exception:
+                pass
 
     @discord.ui.button(label="Zapisz się", style=discord.ButtonStyle.success)
     async def join_btn(self, interaction: discord.Interaction, _: discord.ui.Button):
@@ -1420,8 +1391,11 @@ async def create_mcl(interaction: discord.Interaction, opis: str, voice: discord
     embed = mcl_make_embed(opis, voice, start_at, tp_at, interaction.guild, 0)
     embed.set_footer(text=f"Wystawione przez {author.display_name}")
     allowed = discord.AllowedMentions(everyone=True)
-    await interaction.response.send_message(content="@everyone", embed=embed, view=view, allowed_mentions=allowed)
-    msg = await interaction.original_response()
+    try:
+        await interaction.response.send_message("✅ Ogłoszenie wysłane.", ephemeral=True)
+    except Exception:
+        pass
+    msg = await interaction.channel.send(content="@everyone", embed=embed, view=view, allowed_mentions=allowed)
     view.message = msg
 
 
@@ -1570,8 +1544,11 @@ async def create_zonewars(interaction: discord.Interaction, opis: str, voice: di
     embed = mcl_make_embed(opis, voice, start_at, tp_at, interaction.guild, 0)
     embed.set_footer(text=f"Wystawione przez {author.display_name}")
     allowed = discord.AllowedMentions(everyone=True)
-    await interaction.response.send_message(content="@everyone", embed=embed, view=view, allowed_mentions=allowed)
-    msg = await interaction.original_response()
+    try:
+        await interaction.response.send_message("✅ Ogłoszenie wysłane.", ephemeral=True)
+    except Exception:
+        pass
+    msg = await interaction.channel.send(content="@everyone", embed=embed, view=view, allowed_mentions=allowed)
     view.message = msg
 
 
@@ -1597,10 +1574,13 @@ async def create_capt(interaction: discord.Interaction, start_time: str, image_u
     view = CaptView(starts_at, interaction.guild, author, image_url)
     embed = make_main_embed(starts_at, [], interaction.guild, author, image_url)
     allowed = discord.AllowedMentions(everyone=True)
-    await interaction.response.send_message(content="@everyone", embed=embed, view=view, allowed_mentions=allowed)
-    msg = await interaction.original_response()
+    try:
+        await interaction.response.send_message("✅ Ogłoszenie wysłane.", ephemeral=True)
+    except Exception:
+        pass
+    msg = await interaction.channel.send(content="@everyone", embed=embed, view=view, allowed_mentions=allowed)
     view.message = msg
-    ACTIVE_CAPTS[(interaction.guild.id, interaction.channel.id)] = view
+    ACTIVE_CAPTS.setdefault((interaction.guild.id, interaction.channel.id), []).append(view)
 
     async def ticker():
         try:
@@ -1622,7 +1602,8 @@ async def create_capt(interaction: discord.Interaction, start_time: str, image_u
 @role_required_check()
 async def panel_capt(interaction: discord.Interaction):
     key = (interaction.guild.id, interaction.channel.id)
-    capt = ACTIVE_CAPTS.get(key)
+    capt_entry = ACTIVE_CAPTS.get(key)
+    capt = (capt_entry[-1] if isinstance(capt_entry, list) and capt_entry else capt_entry)
     if not capt or not capt.message:
         return await interaction.response.send_message("Brak aktywnego ogłoszenia w tym kanale.", ephemeral=True)
     mem: discord.Member = interaction.user
@@ -1658,8 +1639,11 @@ async def airdrop(interaction: discord.Interaction, info_text: str, voice: disco
     view = AirdropView(starts_at, interaction.guild, author, info_text, voice, 0)
     embed = make_airdrop_embed(starts_at, [], interaction.guild, author, info_text, voice, 0, queue_len=0)
     allowed = discord.AllowedMentions(everyone=True)
-    await interaction.response.send_message(content="@everyone", embed=embed, view=view, allowed_mentions=allowed)
-    msg = await interaction.original_response()
+    try:
+        await interaction.response.send_message("✅ Ogłoszenie wysłane.", ephemeral=True)
+    except Exception:
+        pass
+    msg = await interaction.channel.send(content="@everyone", embed=embed, view=view, allowed_mentions=allowed)
     view.message = msg
     ACTIVE_AIRDROPS[(interaction.guild.id, interaction.channel.id)] = view
 
@@ -1791,7 +1775,11 @@ async def ping_cayo(interaction: discord.Interaction, voice_channel: discord.Voi
     if LOGO: embed.set_thumbnail(url=LOGO)
     if IMAGE: embed.set_image(url=IMAGE)
     embed.set_footer(text="Zapisani: 0")
-    await interaction.response.send_message(content="@everyone", embed=embed, view=view)
+    try:
+        await interaction.response.send_message("✅ Wysłano ping.", ephemeral=True)
+    except Exception:
+        pass
+    await interaction.channel.send(content="@everyone", embed=embed, view=view)
 
 
 @bot.tree.command(name="ping-zancudo", description="Ping o Zancudo (z licznikiem i przyciskiem Będę)")
@@ -1839,7 +1827,11 @@ async def ping_zancudo(interaction: discord.Interaction, voice_channel: discord.
     if LOGO: embed.set_thumbnail(url=LOGO)
     if IMAGE: embed.set_image(url=IMAGE)
     embed.set_footer(text="Zapisani: 0")
-    await interaction.response.send_message(content="@everyone", embed=embed, view=view)
+    try:
+        await interaction.response.send_message("✅ Wysłano ping.", ephemeral=True)
+    except Exception:
+        pass
+    await interaction.channel.send(content="@everyone", embed=embed, view=view)
 
 
 @bot.tree.command(name="ping-magazyny", description="Ping o magazynach (z licznikiem i przyciskiem Będę)")
@@ -1884,7 +1876,11 @@ async def ping_magazyny(interaction: discord.Interaction, voice_channel: discord
     LOGO = os.getenv("LOGO_URL", "")
     if LOGO: embed.set_thumbnail(url=LOGO)
     embed.set_footer(text="Zapisani: 0")
-    await interaction.response.send_message(content="@everyone", embed=embed, view=view)
+    try:
+        await interaction.response.send_message("✅ Wysłano ping.", ephemeral=True)
+    except Exception:
+        pass
+    await interaction.channel.send(content="@everyone", embed=embed, view=view)
 
 
 @bot.tree.command(name="ping-dilerzy", description="Ping o dilerach (z licznikiem i przyciskiem Będę)")
@@ -1929,7 +1925,11 @@ async def ping_dilerzy(interaction: discord.Interaction, voice_channel: discord.
     LOGO = os.getenv("LOGO_URL", "")
     if LOGO: embed.set_thumbnail(url=LOGO)
     embed.set_footer(text="Zapisani: 0")
-    await interaction.response.send_message(content="@everyone", embed=embed, view=view)
+    try:
+        await interaction.response.send_message("✅ Wysłano ping.", ephemeral=True)
+    except Exception:
+        pass
+    await interaction.channel.send(content="@everyone", embed=embed, view=view)
 
 def _check_env():
     if not TOKEN:
@@ -1985,4 +1985,3 @@ if __name__ == "__main__":
         await runner.cleanup()
 
     asyncio.run(_main())
-
