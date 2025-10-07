@@ -85,7 +85,7 @@ REQUIRED_ROLE_ID = int(os.getenv("REQUIRED_ROLE_ID", "0"))
 CAYO_IMAGE_URL    = os.getenv("CAYO_IMAGE_URL", "https://cdn.discordapp.com/attachments/1224129510535069766/1414204332747915274/image.png?ex=68e644eb&is=68e4f36b&hm=85fb17e716b33129fe78f48823089127f4dfbf5d3336428125dd7ec9576b2838&")
 ZANCUDO_IMAGE_URL = os.getenv("ZANCUDO_IMAGE_URL", "https://cdn.discordapp.com/attachments/1224129510535069766/1414194392214011974/image.png?ex=68e63ba9&is=68e4ea29&hm=50dc577e382a4f9c3c5f40c2c7debad58ae5e62eb4975441ee4df85c76ea53b3&")
 LOGO_URL          = os.getenv("LOGO_URL", "https://cdn.discordapp.com/icons/1422343547780337819/683dd456c5dc7e124326d4d810992d07.webp?size=1024")
-CAPT_CHANNEL_ID   = int(os.getenv("CAPT_CHANNEL_ID", "0"))
+CAPT_CHANNEL_ID   = int(os.getenv("CAPT_CHANNEL_ID", "1422343549386752000"))
 
 intents = discord.Intents.default()
 intents.message_content = False
@@ -1985,3 +1985,4 @@ if __name__ == "__main__":
         await runner.cleanup()
 
     asyncio.run(_main())
+
