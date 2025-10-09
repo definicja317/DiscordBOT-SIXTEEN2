@@ -675,28 +675,79 @@ def make_airdrop_picked_embed(picked_ids, guild: discord.Guild, picker: discord.
     footer_by = picker.display_name if isinstance(picker, discord.Member) else (picker or "Bot")
     emb.set_footer(text=f"Wytypował: {footer_by} • {now_pl.strftime('%d.%m.%Y %H:%M')}")
     return emb
+class AirdropPagedPickView(discord.ui.View):
+    """Paginowany PICK z zapisanych do WYTYPOWANYCH (AirDrop): max 20, strony po 25 opcji."""
+    PAGE_SIZE = 25
+    MAX_PICK = 20
 
-class AirdropPickView(discord.ui.View):
-    def __init__(self, adr: "AirdropView", option_rows, picker: discord.Member):
+    def __init__(self, adr: "AirdropView", picker: discord.Member):
         super().__init__(timeout=300)
         self.adr = adr
         self.picker = picker
-        options = []
-        for idx, (uid, nick, desc) in enumerate(option_rows, start=1):
-            options.append(discord.SelectOption(label=(f"{idx}. {nick}")[:100], value=str(uid), description=(desc or f"ID {uid}")[:100]))
-        max_vals = min(20, len(options)) or 1
-        self.sel = discord.ui.Select(placeholder="Wybierz osoby (max 20)", min_values=0, max_values=max_vals, options=options)
-        self.add_item(self.sel)
+        self.option_rows: list[tuple[int,str,str]] = []
+        for uid in getattr(self.adr, "users", []):
+            try:
+                m = self.adr.guild.get_member(uid)
+            except Exception:
+                m = None
+            nick = m.display_name if m else f"User {uid}"
+            desc = f"@{m.name}" if m else f"ID {uid}"
+            self.option_rows.append((uid, nick, desc))
+        self.page = 0
+        self.page_selections: dict[int, set[int]] = {}
+        self._build_page()
+
+    def _build_page(self):
+        for child in list(self.children):
+            if isinstance(child, discord.ui.Select):
+                self.remove_item(child)
+
+        start = self.page * self.PAGE_SIZE
+        end   = start + self.PAGE_SIZE
+        slice_rows = self.option_rows[start:end]
+
+        current_total = sum(len(s) for s in self.page_selections.values())
+        remaining = max(0, self.MAX_PICK - current_total)
+
+        options = [
+            discord.SelectOption(
+                label=f"{idx}. {label}"[:100],
+                value=str(uid),
+                description=(desc or f"ID {uid}")[:100]
+            )
+            for idx, (uid, label, desc) in enumerate(slice_rows, start=1)
+        ]
+
+        if not options:
+            self.add_item(discord.ui.Button(label="Brak osób na tej stronie", style=discord.ButtonStyle.secondary, disabled=True))
+            return
+
+        if remaining == 0:
+            sel = discord.ui.Select(
+                placeholder=f"Wybrano {current_total}/{self.MAX_PICK}. Limit osiągnięty.",
+                min_values=0, max_values=0, options=options, disabled=True
+            )
+        else:
+            total_pages = (len(self.option_rows)-1)//self.PAGE_SIZE+1 if self.option_rows else 1
+            sel = discord.ui.Select(
+                placeholder=f"Strona {self.page+1}/{total_pages} • wybierz (max {remaining})",
+                min_values=0, max_values=min(len(options), remaining), options=options
+            )
+
         async def _on_select(inter: discord.Interaction):
-            chosen_ids = [int(v) for v in self.sel.values]
-            if not chosen_ids:
-                txt = "Nic nie zaznaczono. Kliknij **Publikuj Wytypowanych**."
-            else:
-                lines = []
-                for i, uid in enumerate(chosen_ids, start=1):
-                    m = adr.guild.get_member(uid)
-                    lines.append(f"{i}. {m.display_name if m else f'User {uid}'}")
-                txt = f"Zaznaczono {len(chosen_ids)}:\n" + "\n".join(lines)
+            chosen = {int(v) for v in (sel.values or [])}
+            self.page_selections[self.page] = chosen
+            current_total = sum(len(s) for s in self.page_selections.values())
+            names = []
+            for s in self.page_selections.values():
+                for uid in s:
+                    try:
+                        m = self.adr.guild.get_member(uid)
+                        names.append(m.display_name if m else f"ID {uid}")
+                    except Exception:
+                        names.append(f"ID {uid}")
+            txt = f"Zaznaczono {current_total}/{self.MAX_PICK}:\n" + (", ".join(names) if names else "-")
+            self._build_page()
             try:
                 await inter.response.edit_message(content=txt, view=self)
             except Exception:
@@ -704,20 +755,53 @@ class AirdropPickView(discord.ui.View):
                     await inter.response.defer(ephemeral=True, thinking=False)
                 except Exception:
                     pass
-                await inter.followup.send(txt, ephemeral=True)
-        self.sel.callback = _on_select
+
+        sel.callback = _on_select
+        self.add_item(sel)
+
+    @discord.ui.button(label="◀︎", style=discord.ButtonStyle.secondary)
+    async def prev_page(self, interaction: discord.Interaction, _: discord.ui.Button):
+        if self.page > 0:
+            self.page -= 1
+            self._build_page()
+        await interaction.response.edit_message(view=self)
+
+    @discord.ui.button(label="▶︎", style=discord.ButtonStyle.secondary)
+    async def next_page(self, interaction: discord.Interaction, _: discord.ui.Button):
+        max_page = (len(self.option_rows) - 1) // self.PAGE_SIZE if self.option_rows else 0
+        if self.page < max_page:
+            self.page += 1
+            self._build_page()
+        await interaction.response.edit_message(view=self)
+
+    @discord.ui.button(label="Wyczyść wybór", style=discord.ButtonStyle.danger)
+    async def clear_sel(self, interaction: discord.Interaction, _: discord.ui.Button):
+        self.page_selections.clear()
+        self._build_page()
+        await interaction.response.edit_message(content="Wyczyszczono wybór.", view=self)
+
     @discord.ui.button(label="Publikuj Wytypowanych", style=discord.ButtonStyle.success)
     async def publish(self, interaction: discord.Interaction, _: discord.ui.Button):
-        chosen = [int(v) for v in self.sel.values]
+        chosen: list[int] = []
+        for s in self.page_selections.values():
+            chosen.extend(list(s))
+        chosen = list(dict.fromkeys(chosen))[:self.MAX_PICK]
         if not chosen:
-            return await interaction.response.edit_message(content="Nie wybrałeś żadnych osób.", view=self)
-        self.adr.picked_list = list(dict.fromkeys(self.adr.picked_list + chosen))
-        await self.adr.refresh_picked_embed(interaction.channel, interaction.user)
-        await interaction.response.edit_message(content="Opublikowano/odświeżono listę **Wytypowani na AirDrop!**", view=self)
-    @discord.ui.button(label="Anuluj", style=discord.ButtonStyle.secondary)
-    async def cancel(self, interaction: discord.Interaction, _: discord.ui.Button):
-        await interaction.response.edit_message(content="Anulowano wybór.", view=None)
-        self.stop()
+            return await interaction.response.edit_message(content="Nie wybrano żadnych osób.", view=self)
+
+        try:
+            existing = list(getattr(self.adr, "picked_list", []))
+            self.adr.picked_list = list(dict.fromkeys(existing + chosen))
+            await self.adr.refresh_picked_embed(interaction.channel, interaction.user)
+            await interaction.response.edit_message(content="Opublikowano/odświeżono listę Wytypowani na AirDrop!", view=None)
+        except Exception:
+            emb = discord.Embed(title="Wytypowani na AirDrop", description="\n".join(f"• <@{uid}>" for uid in chosen))
+            try:
+                await interaction.channel.send(embed=emb)
+            except Exception:
+                pass
+            await interaction.response.edit_message(content="Opublikowano listę (fallback).", view=None)
+
 
 class AirdropView(discord.ui.View):
     def __init__(self, starts_at: datetime, guild: discord.Guild, author: discord.Member,
@@ -799,18 +883,12 @@ class AirdropView(discord.ui.View):
 
     @discord.ui.button(label="PICK", style=discord.ButtonStyle.secondary)
     async def pick_from_signups(self, interaction: discord.Interaction, _: discord.ui.Button):
-        if not self.users:
+        if not getattr(self, "users", []):
             await interaction.response.send_message("Brak zapisanych.", ephemeral=True)
             return
-        option_rows = []
-        for uid in self.users:
-            m = self.guild.get_member(uid)
-            nick = m.display_name if m else f"User {uid}"
-            desc = f"@{m.name}" if m else f"ID {uid}"
-            option_rows.append((uid, nick, desc))
-        view = AirdropPickView(self, option_rows, interaction.user)
+        view = AirdropPagedPickView(self, interaction.user)
         await interaction.response.send_message(
-            "Wybierz osoby z **zapisanych** (**max 20**) do wytypowania. Następnie kliknij **Publikuj Wytypowanych**.",
+            "Wybierz osoby z pełnej listy zapisanych (paginacja ◀︎ ▶︎, max 20), potem **Publikuj Wytypowanych**.",
             view=view, ephemeral=True
         )
 
@@ -1049,35 +1127,84 @@ class MclSelectedView(discord.ui.View):
                 await interaction.followup.send("Panel zarządzania składem:", ephemeral=True, view=MclManagePanel(self))
             except Exception:
                 pass
+class MclPagedPickView(discord.ui.View):
+    """Paginowany PICK dla MCL/ZoneWars: przeglądaj wszystkich zapisanych (po 25) i wybierz max self.mcl.max_pick."""
+    PAGE_SIZE = 25
 
-
-
-class MclPickView(discord.ui.View):
     def __init__(self, mclview: "MclView", opener: discord.Member):
-        super().__init__(timeout=180)
+        super().__init__(timeout=300)
         self.mcl = mclview
         self.opener = opener
-
-        # build options from signups
-        options = []
-        for uid in self.mcl.signups[:25]:
-            m = self.mcl.guild.get_member(uid)
-            label = (m.display_name if m else f"User {uid}")[:100]
-            options.append(discord.SelectOption(label=label, value=str(uid)))
-        placeholder = f"Wybierz graczy (max {self.mcl.max_pick})"
-        self.select = discord.ui.Select(placeholder=placeholder, min_values=0, max_values = min(self.mcl.max_pick, len(options)), options=options)
-        self.add_item(self.select)
-        self.select.callback = self._on_select  # wire once
-
-    async def _on_select(self, inter: discord.Interaction):
-        # Always acknowledge the interaction to avoid 'This action failed'
-        try:
-            chosen = [int(v) for v in (self.select.values or [])]
-            names = []
-            for uid in chosen:
+        self.option_rows: list[tuple[int,str,str]] = []
+        for uid in getattr(self.mcl, "signups", []):
+            try:
                 m = self.mcl.guild.get_member(uid)
-                names.append(m.display_name if m else str(uid))
-            txt = "Wybrane osoby: " + (", ".join(names) if names else "brak")
+            except Exception:
+                m = None
+            label = m.display_name if m else f"User {uid}"
+            desc  = ""
+            try:
+                desc = (self.mcl.input_map.get(uid, "")[:96])
+            except Exception:
+                pass
+            if not desc:
+                desc = (f"@{m.name}" if m else f"ID {uid}")
+            self.option_rows.append((uid, label, desc))
+        self.page = 0
+        self.page_selections: dict[int, set[int]] = {}
+        self._build_page()
+
+    def _build_page(self):
+        for child in list(self.children):
+            if isinstance(child, discord.ui.Select):
+                self.remove_item(child)
+
+        start = self.page * self.PAGE_SIZE
+        end   = start + self.PAGE_SIZE
+        slice_rows = self.option_rows[start:end]
+
+        current_total = sum(len(s) for s in self.page_selections.values())
+        max_pick = getattr(self.mcl, "max_pick", 20)
+        remaining = max(0, max_pick - current_total)
+
+        options: list[discord.SelectOption] = []
+        for idx, (uid, label, desc) in enumerate(slice_rows, start=1):
+            options.append(discord.SelectOption(
+                label=f"{idx}. {label}"[:100],
+                value=str(uid),
+                description=(desc or f"ID {uid}")[:100]
+            ))
+
+        if not options:
+            self.add_item(discord.ui.Button(label="Brak osób na tej stronie", style=discord.ButtonStyle.secondary, disabled=True))
+            return
+
+        if remaining == 0:
+            sel = discord.ui.Select(
+                placeholder=f"Wybrano {current_total}/{max_pick}. Limit osiągnięty.",
+                min_values=0, max_values=0, options=options, disabled=True
+            )
+        else:
+            total_pages = (len(self.option_rows)-1)//self.PAGE_SIZE+1 if self.option_rows else 1
+            sel = discord.ui.Select(
+                placeholder=f"Strona {self.page+1}/{total_pages} • wybierz (max {remaining})",
+                min_values=0, max_values=min(len(options), remaining), options=options
+            )
+
+        async def _on_select(inter: discord.Interaction):
+            chosen = {int(v) for v in (sel.values or [])}
+            self.page_selections[self.page] = chosen
+            current_total = sum(len(s) for s in self.page_selections.values())
+            names = []
+            for s in self.page_selections.values():
+                for uid in s:
+                    try:
+                        m = self.mcl.guild.get_member(uid)
+                        names.append(m.display_name if m else f"ID {uid}")
+                    except Exception:
+                        names.append(f"ID {uid}")
+            txt = f"Zaznaczono {current_total}/{getattr(self.mcl,'max_pick',20)}:\n" + (", ".join(names) if names else "-")
+            self._build_page()
             try:
                 await inter.response.edit_message(content=txt, view=self)
             except Exception:
@@ -1085,42 +1212,60 @@ class MclPickView(discord.ui.View):
                     await inter.response.defer(ephemeral=True, thinking=False)
                 except Exception:
                     pass
-                await inter.followup.send(txt, ephemeral=True)
-        except Exception:
-            # last resort so discord doesn't show the red error
-            try:
-                if inter.response.is_done():
-                    await inter.followup.send("Zaznaczanie nie powiodło się, spróbuj ponownie.", ephemeral=True)
-                else:
-                    await inter.response.send_message("Zaznaczanie nie powiodło się, spróbuj ponownie.", ephemeral=True)
-            except Exception:
-                pass
+
+        sel.callback = _on_select
+        self.add_item(sel)
+
+    @discord.ui.button(label="◀︎", style=discord.ButtonStyle.secondary)
+    async def prev_page(self, interaction: discord.Interaction, _: discord.ui.Button):
+        if self.page > 0:
+            self.page -= 1
+            self._build_page()
+        await interaction.response.edit_message(view=self)
+
+    @discord.ui.button(label="▶︎", style=discord.ButtonStyle.secondary)
+    async def next_page(self, interaction: discord.Interaction, _: discord.ui.Button):
+        max_page = (len(self.option_rows) - 1) // self.PAGE_SIZE if self.option_rows else 0
+        if self.page < max_page:
+            self.page += 1
+            self._build_page()
+        await interaction.response.edit_message(view=self)
+
+    @discord.ui.button(label="Wyczyść wybór", style=discord.ButtonStyle.danger)
+    async def clear_sel(self, interaction: discord.Interaction, _: discord.ui.Button):
+        self.page_selections.clear()
+        self._build_page()
+        await interaction.response.edit_message(content="Wyczyszczono wybór.", view=self)
 
     @discord.ui.button(label="Publikuj listę", style=discord.ButtonStyle.success)
-    async def publish(self, interaction: discord.Interaction, button: discord.ui.Button):
-        values = self.select.values or []
-        chosen = [int(v) for v in values]
+    async def publish(self, interaction: discord.Interaction, _: discord.ui.Button):
+        chosen: list[int] = []
+        for s in self.page_selections.values():
+            chosen.extend(list(s))
+        chosen = list(dict.fromkeys(chosen))[:getattr(self.mcl,'max_pick',20)]
         if not chosen:
             return await interaction.response.edit_message(content="Nie wybrano żadnych osób.", view=self)
 
-        self.mcl.selected_ids = list(dict.fromkeys(chosen))
-        sel_view = MclSelectedView(self.mcl, interaction.user)
-        await sel_view.refresh_selected_embed(interaction.channel, interaction.user)
+        setattr(self.mcl, "selected_ids", list(chosen))
+        try:
+            sel_view = MclSelectedView(self.mcl, interaction.user)
+            await sel_view.refresh_selected_embed(interaction.channel, interaction.user)
+            await interaction.response.edit_message(
+                content=f"Opublikowano listę Wytypowani na {getattr(self.mcl,'event_name','MCL')}!",
+                view=None
+            )
+        except Exception:
+            emb = discord.Embed(title=f"Wytypowani na {getattr(self.mcl,'event_name','MCL')}",
+                                description="\n".join(f"• <@{uid}>" for uid in chosen))
+            try:
+                await interaction.channel.send(embed=emb)
+            except Exception:
+                pass
+            await interaction.response.edit_message(content="Opublikowano listę (fallback).", view=None)
 
-        await interaction.response.edit_message(content=f"Opublikowano listę **Wytypowani na {self.mcl.event_name}!** (dodano przycisk **NadajRole**).", view=None)
-
-    @discord.ui.button(label="Anuluj", style=discord.ButtonStyle.secondary)
-    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.edit_message(content="Anulowano.", view=None)
-        self.stop()
 
 
 
-
-class ZoneWarsPickView(MclPickView):
-    """Oddzielny widok picków dla ZoneWars."""
-    def __init__(self, mcl_view: "MclView", opener: discord.Member):
-        super().__init__(mcl_view, opener)
 
 class MclManagePanel(discord.ui.View):
     """Panel z przyciskami: Dodaj z zapisanych / Usuń z wytypowanych"""
@@ -1337,17 +1482,14 @@ class MclView(discord.ui.View):
     @discord.ui.button(label="Wystaw na event (ADMIN)", style=discord.ButtonStyle.primary)
     async def admin_pick_btn(self, interaction: discord.Interaction, _: discord.ui.Button):
         mem: discord.Member = interaction.user
-        if not (mem.guild_permissions.administrator or (REQUIRED_ROLE_ID and any(r.id == REQUIRED_ROLE_ID for r in mem.roles))):
-            return await interaction.response.send_message("Panel tylko dla adminów / wymaganej roli.", ephemeral=True)
-        if not self.signups:
-            return await interaction.response.send_message("Brak zapisanych.", ephemeral=True)
-        view = ZoneWarsPickView(self, mem) if self.event_name == "ZoneWars" else MclPickView(self, mem)
+        if not getattr(self, "signups", []):
+            await interaction.response.send_message("Brak zapisanych.", ephemeral=True)
+            return
+        view = MclPagedPickView(self, mem)
         await interaction.response.send_message(
-            f"Wybierz osoby do **Wytypowani na {self.event_name}!** (max {self.max_pick}). Potem kliknij **Publikuj listę**.",
+            f"Wybierz osoby do **Wytypowani na {getattr(self,'event_name','MCL')}!** (max {getattr(self,'max_pick',20)}). Paginacja ◀︎ ▶︎, potem **Publikuj listę**.",
             view=view, ephemeral=True
         )
-
-# ===================== SLASH COMMANDS =====================
 @bot.tree.command(name="create-mcl", description="Stwórz ogłoszenie MCL: opis, kanał, start, teleportacja.")
 @role_required_check()
 @app_commands.describe(
