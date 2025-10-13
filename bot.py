@@ -2662,7 +2662,7 @@ if __name__ == "__main__":
         app = _create_web_app()
         runner = web.AppRunner(app)
         await runner.setup()
-        port = int(os.getenv("PORT", "10000"))
+        port = int(os.getenv("PORT", "8080"))
         site = web.TCPSite(runner, "0.0.0.0", port)
         await site.start()
 
@@ -2683,5 +2683,6 @@ if __name__ == "__main__":
         await runner.cleanup()
 
     asyncio.run(_main())
+
 
 
